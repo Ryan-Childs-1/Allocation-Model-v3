@@ -21,7 +21,7 @@ from two_model_prediction_system import (
     read_json,
 )
 
-st.set_page_config(page_title="Allocation AI · Base Allocation + Base Review", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Allocation AI · Base Allocation + Base Review · sklearn-free", page_icon="🎯", layout="wide")
 
 APP_TITLE = "🎯 Allocation AI · Two-Model Predictor"
 ARTIFACT_NAME = "Base Allocation + Base Review"

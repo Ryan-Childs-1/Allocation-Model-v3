@@ -1,11 +1,6 @@
-# Allocation AI Two-Model Streamlit App
+# Allocation AI Two-Model Predictor — sklearn-free runtime
 
-This Streamlit app uses two packaged MLP models:
-
-- **Base Allocation** for rows flagged Allocate
-- **Base Review** for rows flagged Review
-
-Rows not flagged Allocate or Review are intentionally ignored and left blank.
+This Streamlit app runs the Base Allocation and Base Review models without installing scikit-learn. The trained sklearn MLPs were converted into NumPy-only bundles containing preprocessing parameters and neural-network weights.
 
 ## Run locally
 
@@ -14,16 +9,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Output
+## Included runtime dependencies
 
-The app returns:
+- streamlit
+- pandas
+- numpy
+- joblib
+- pyxlsb
+- openpyxl
 
-- `completed_allocation.csv`
-- `allocation_audit.csv`
-- `prediction_summary.json`
-- `model_feature_importance.csv`
-- `prediction_feature_relationships.csv`
-
-## Files
-
-The package is flat and includes the two trained joblib models plus their metadata, threshold sweeps, training progress, and validation prediction files.
+No `scikit-learn`, TensorFlow, Torch, or JAX is required at prediction time.

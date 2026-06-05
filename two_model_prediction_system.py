@@ -24,7 +24,7 @@ class TwoPredictionConfig:
     allocation_threshold: float | None = None
     review_threshold: float | None = None
     demand_cap_extra_flm: float = 1.0
-    alloc_rec_influence: str = "balanced"  # feature_only, soft_cap, balanced, hard_cap
+    alloc_rec_influence: str = "balanced"
     prefer_left_dc: bool = True
     allow_partial_leftover_below_flm: bool = True
     review_priority_weight: float = 0.50
@@ -36,123 +36,35 @@ class TwoPredictionConfig:
 
 
 # -----------------------------------------------------------------------------
-# scikit-learn compatibility repairs
+# NumPy-only model loader/inference. No scikit-learn is imported in this file.
 # -----------------------------------------------------------------------------
-def _walk_estimator_tree(obj: Any, seen: set[int] | None = None):
-    if obj is None:
-        return
-    if seen is None:
-        seen = set()
-    oid = id(obj)
-    if oid in seen:
-        return
-    seen.add(oid)
-    yield obj
-    steps = getattr(obj, "steps", None)
-    if steps:
-        for _name, step in steps:
-            yield from _walk_estimator_tree(step, seen)
-    transformers = getattr(obj, "transformers_", None) or getattr(obj, "transformers", None)
-    if transformers:
-        for item in transformers:
-            if not item or len(item) < 2:
-                continue
-            trans = item[1]
-            if trans in (None, "drop", "passthrough"):
-                continue
-            yield from _walk_estimator_tree(trans, seen)
-    for attr in ("estimator", "estimator_", "base_estimator", "base_estimator_", "calibrated_classifiers_"):
-        try:
-            val = getattr(obj, attr, None)
-        except Exception:
-            val = None
-        if val is None:
-            continue
-        if isinstance(val, (list, tuple)):
-            for child in val:
-                yield from _walk_estimator_tree(child, seen)
-        else:
-            yield from _walk_estimator_tree(val, seen)
-
-
-def repair_sklearn_pickle_compat(bundle: dict) -> dict:
-    if not isinstance(bundle, dict):
-        return bundle
-    try:
-        from sklearn.impute import SimpleImputer
-    except Exception:
-        SimpleImputer = None
-    try:
-        from sklearn.preprocessing import OneHotEncoder
-    except Exception:
-        OneHotEncoder = None
-    repairs = []
-    for root in [bundle.get("preprocessor"), bundle.get("unit_model"), bundle.get("prob_model"), bundle.get("priority_model")]:
-        for est in _walk_estimator_tree(root):
-            cls = est.__class__.__name__
-            if cls == "ColumnTransformer":
-                for attr, val in [("force_int_remainder_cols", "deprecated"), ("verbose_feature_names_out", True)]:
-                    if not hasattr(est, attr):
-                        try:
-                            setattr(est, attr, val)
-                            repairs.append(f"ColumnTransformer.{attr}")
-                        except Exception:
-                            pass
-            if (SimpleImputer is not None and isinstance(est, SimpleImputer)) or cls == "SimpleImputer":
-                if not hasattr(est, "_fill_dtype"):
-                    fill_dtype = getattr(est, "_fit_dtype", None)
-                    stats = getattr(est, "statistics_", None)
-                    if fill_dtype is None and stats is not None:
-                        fill_dtype = getattr(stats, "dtype", None)
-                    if fill_dtype is None:
-                        fill_dtype = object if getattr(est, "strategy", None) == "constant" else float
-                    try:
-                        est._fill_dtype = fill_dtype
-                        repairs.append("SimpleImputer._fill_dtype")
-                    except Exception:
-                        pass
-                for attr, val in [("keep_empty_features", False), ("indicator_", None), ("add_indicator", False)]:
-                    if not hasattr(est, attr):
-                        try:
-                            setattr(est, attr, val)
-                            repairs.append(f"SimpleImputer.{attr}")
-                        except Exception:
-                            pass
-            if (OneHotEncoder is not None and isinstance(est, OneHotEncoder)) or cls == "OneHotEncoder":
-                if not hasattr(est, "sparse_output"):
-                    try:
-                        est.sparse_output = getattr(est, "sparse", True)
-                        repairs.append("OneHotEncoder.sparse_output")
-                    except Exception:
-                        pass
-                for attr, val in [("_infrequent_enabled", False), ("feature_name_combiner", "concat")]:
-                    if not hasattr(est, attr):
-                        try:
-                            setattr(est, attr, val)
-                            repairs.append(f"OneHotEncoder.{attr}")
-                        except Exception:
-                            pass
-    bundle["__compat_repairs"] = list(dict.fromkeys(bundle.get("__compat_repairs", []) + repairs))
-    return bundle
+def _joblib_part_paths(path: str | Path) -> list[Path]:
+    p = Path(path)
+    return sorted(p.parent.glob(p.name + ".part*"))
 
 
 def _load_joblib_with_split_support(path: str | Path):
     p = Path(path)
     if p.exists():
         return joblib.load(p)
-    parts = sorted(p.parent.glob(p.name + ".part*"))
+    parts = _joblib_part_paths(p)
     if parts:
-        data = b"".join(part.read_bytes() for part in parts)
-        return joblib.load(io.BytesIO(data))
+        return joblib.load(io.BytesIO(b"".join(part.read_bytes() for part in parts)))
     raise FileNotFoundError(f"Could not find model file {p} or split parts like {p.name}.part01")
 
 
 def _load_bundle(path: str | Path) -> dict:
-    return repair_sklearn_pickle_compat(_load_joblib_with_split_support(path))
+    bundle = _load_joblib_with_split_support(path)
+    if not isinstance(bundle, dict) or bundle.get("format") != "allocation_ai_numpy_mlp_v1":
+        raise ValueError(
+            f"{path} is not a NumPy-only Allocation AI model bundle. "
+            "This Streamlit package intentionally does not use scikit-learn. "
+            "Use the converted *_numpy.joblib models included with this package."
+        )
+    return bundle
 
 
 def load_two_models(folder_or_zip: str | Path | None = None) -> Dict[str, dict]:
-    """Load the two packaged section models from the app folder or an artifact zip."""
     if folder_or_zip is None:
         return _load_models_from_dir(Path("."))
     p = Path(folder_or_zip)
@@ -174,7 +86,7 @@ def _load_models_from_dir(root: Path) -> Dict[str, dict]:
     }
     models = {}
     for label, path in paths.items():
-        if path.exists() or sorted(path.parent.glob(path.name + ".part*")):
+        if path.exists() or _joblib_part_paths(path):
             bundle = _load_bundle(path)
             bundle["__model_file"] = str(path)
             models[label] = bundle
@@ -216,6 +128,131 @@ def _flag_masks(flag: pd.Series):
     return is_alloc, is_review, is_z
 
 
+def _sigmoid(x):
+    x = np.clip(x, -60, 60)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _softmax(x):
+    x = x - np.max(x, axis=1, keepdims=True)
+    e = np.exp(np.clip(x, -60, 60))
+    return e / np.maximum(e.sum(axis=1, keepdims=True), EPS)
+
+
+def _activation(x, name: str):
+    if name == "relu":
+        return np.maximum(x, 0)
+    if name == "logistic":
+        return _sigmoid(x)
+    if name == "tanh":
+        return np.tanh(x)
+    if name == "identity":
+        return x
+    return np.maximum(x, 0)
+
+
+def _mlp_raw(X: np.ndarray, model: dict) -> np.ndarray:
+    h = X.astype(np.float32, copy=False)
+    coefs = model["coefs"]
+    intercepts = model["intercepts"]
+    hidden_activation = model.get("activation", "relu")
+    for i, (w, b) in enumerate(zip(coefs, intercepts)):
+        h = h @ w + b
+        if i < len(coefs) - 1:
+            h = _activation(h, hidden_activation)
+    return h
+
+
+def _mlp_predict(model: dict, X: np.ndarray) -> np.ndarray:
+    raw = _mlp_raw(X, model)
+    out_activation = model.get("out_activation", "identity")
+    classes = model.get("classes")
+    if classes is not None:
+        classes = np.asarray(classes)
+        if out_activation == "softmax":
+            p = _softmax(raw)
+            return classes[np.argmax(p, axis=1)]
+        if out_activation == "logistic":
+            p1 = _sigmoid(raw).reshape(-1)
+            idx = (p1 >= 0.5).astype(int)
+            return classes[np.minimum(idx, len(classes)-1)]
+        return classes[np.argmax(raw, axis=1)]
+    # regressor
+    return raw.reshape(-1)
+
+
+def _mlp_predict_proba_positive(model: dict, X: np.ndarray) -> np.ndarray:
+    raw = _mlp_raw(X, model)
+    classes = model.get("classes")
+    out_activation = model.get("out_activation", "identity")
+    if classes is None:
+        return np.clip(raw.reshape(-1), 0, 1)
+    classes = list(np.asarray(classes).tolist())
+    if out_activation == "softmax":
+        p = _softmax(raw)
+        return p[:, classes.index(1)] if 1 in classes else np.zeros(len(X), dtype=np.float32)
+    if out_activation == "logistic":
+        p1 = _sigmoid(raw).reshape(-1)
+        return p1 if 1 in classes else 1.0 - p1
+    return np.zeros(len(X), dtype=np.float32)
+
+
+def _transform_numpy_preprocessor(X: pd.DataFrame, bundle: dict) -> np.ndarray:
+    pre = bundle["preprocessor"]
+    num = pre.get("numeric", {})
+    cat = pre.get("categorical", {})
+    parts = []
+
+    ncols = list(num.get("columns", []))
+    if ncols:
+        arr = np.zeros((len(X), len(ncols)), dtype=np.float32)
+        stats = np.asarray(num.get("statistics", np.zeros(len(ncols))), dtype=np.float32)
+        mean = np.asarray(num.get("mean", np.zeros(len(ncols))), dtype=np.float32)
+        scale = np.asarray(num.get("scale", np.ones(len(ncols))), dtype=np.float32)
+        scale = np.where(np.abs(scale) < EPS, 1.0, scale)
+        for j, c in enumerate(ncols):
+            if c in X.columns:
+                s = pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+                vals = s.to_numpy(dtype=np.float32)
+            else:
+                vals = np.full(len(X), np.nan, dtype=np.float32)
+            vals = np.where(np.isfinite(vals), vals, stats[j])
+            arr[:, j] = (vals - mean[j]) / scale[j]
+        parts.append(arr)
+
+    ccols = list(cat.get("columns", []))
+    if ccols:
+        nouts = list(map(int, cat.get("n_features_outs", [])))
+        total = int(sum(nouts))
+        out = np.zeros((len(X), total), dtype=np.float32)
+        cats = cat.get("categories", [])
+        cat_to_idx = cat.get("category_to_index", [])
+        maps = cat.get("maps", [])
+        fill = str(cat.get("fill_value", "") or "")
+        offset = 0
+        for j, c in enumerate(ccols):
+            width = nouts[j]
+            lookup = cat_to_idx[j] if j < len(cat_to_idx) else {}
+            mapping = np.asarray(maps[j], dtype=np.int32) if j < len(maps) else None
+            if c in X.columns:
+                vals = X[c].astype(str).fillna(fill).str.strip().tolist()
+            else:
+                vals = [fill] * len(X)
+            for i, v in enumerate(vals):
+                orig_idx = lookup.get(str(v))
+                if orig_idx is None:
+                    continue  # handle_unknown='ignore'
+                mapped = int(mapping[orig_idx]) if mapping is not None and orig_idx < len(mapping) else int(orig_idx)
+                if 0 <= mapped < width:
+                    out[i, offset + mapped] = 1.0
+            offset += width
+        parts.append(out)
+
+    if not parts:
+        return np.zeros((len(X), 0), dtype=np.float32)
+    return np.concatenate(parts, axis=1).astype(np.float32, copy=False)
+
+
 def _predict_model(df: pd.DataFrame, bundle: dict, chunk_size: int = 2500) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if len(df) == 0:
         return np.zeros(0, dtype=int), np.zeros(0, dtype=float), np.zeros(0, dtype=float)
@@ -229,19 +266,10 @@ def _predict_model(df: pd.DataFrame, bundle: dict, chunk_size: int = 2500) -> Tu
     for start in range(0, len(X_all), chunk_size):
         end = min(len(X_all), start + chunk_size)
         X = X_all.iloc[start:end][cols].replace([np.inf, -np.inf], np.nan)
-        Xt = bundle["preprocessor"].transform(X)
-        if hasattr(Xt, "toarray"):
-            Xt = Xt.toarray()
-        Xt = np.asarray(Xt, dtype=np.float32)
-        units = np.asarray(bundle["unit_model"].predict(Xt), dtype=int)
-        prob_model = bundle["prob_model"]
-        if hasattr(prob_model, "predict_proba"):
-            classes = list(prob_model.classes_)
-            proba = prob_model.predict_proba(Xt)
-            prob = proba[:, classes.index(1)] if 1 in classes else np.zeros(len(Xt))
-        else:
-            prob = np.asarray(prob_model.predict(Xt), dtype=float)
-        priority = np.asarray(bundle["priority_model"].predict(Xt), dtype=float).clip(0, 1)
+        Xt = _transform_numpy_preprocessor(X, bundle)
+        units = np.asarray(_mlp_predict(bundle["unit_model"], Xt), dtype=int)
+        prob = np.asarray(_mlp_predict_proba_positive(bundle["prob_model"], Xt), dtype=float)
+        priority = np.asarray(_mlp_predict(bundle["priority_model"], Xt), dtype=float).clip(0, 1)
         all_units.append(units); all_prob.append(prob); all_priority.append(priority)
     return np.concatenate(all_units), np.concatenate(all_prob), np.concatenate(all_priority)
 
@@ -402,7 +430,6 @@ def predict_allocation_file(df: pd.DataFrame, models: Dict[str, dict], cfg: TwoP
             "reason": "; ".join(reason),
         })
 
-    # Append ignored rows to audit with no prediction for visibility.
     for idx in raw.index[~(is_alloc | is_review)]:
         audit_rows.append({
             "row_order": int(raw.get("__row_order", pd.Series(range(n), index=raw.index)).loc[idx]),
@@ -449,6 +476,7 @@ def predict_allocation_file(df: pd.DataFrame, models: Dict[str, dict], cfg: TwoP
         "review_partial_leftover_units": review_partial_units,
         "allocation_threshold": float(cfg.allocation_threshold if cfg.allocation_threshold is not None else _threshold(models["Base Allocation"], 0.35)),
         "review_threshold": float(cfg.review_threshold if cfg.review_threshold is not None else _threshold(models["Base Review"], 0.35)),
+        "inference_backend": "numpy_only_no_sklearn",
     }
     return out, audit, summary
 
@@ -494,17 +522,13 @@ def feature_family(name: str) -> str:
 
 
 def model_feature_importance(bundle: dict, model_label: str, top_n: int = 80) -> pd.DataFrame:
-    try:
-        names = list(bundle["preprocessor"].get_feature_names_out())
-    except Exception:
-        names = []
+    names = list(bundle.get("transformed_feature_names", []))
     rows = []
     for head_name, key in [("unit", "unit_model"), ("probability", "prob_model"), ("priority", "priority_model")]:
         model = bundle.get(key)
-        coefs = getattr(model, "coefs_", None)
-        if not coefs:
+        if not model or not model.get("coefs"):
             continue
-        w = np.asarray(coefs[0])
+        w = np.asarray(model["coefs"][0])
         imp = np.mean(np.abs(w), axis=1)
         local_names = names if len(names) == len(imp) else [f"transformed_feature_{i}" for i in range(len(imp))]
         for fname, val in zip(local_names, imp):
@@ -539,12 +563,13 @@ def prediction_feature_relationships(df: pd.DataFrame, audit_df: pd.DataFrame, t
         sf = s.fillna(s.median())
         def corr(a, b):
             try:
-                v = float(np.corrcoef(a, b)[0, 1])
+                m = min(len(a), len(b))
+                v = float(np.corrcoef(a[:m], b[:m])[0, 1])
                 return 0.0 if not np.isfinite(v) else v
             except Exception:
                 return 0.0
-        cp = corr(sf.values, target_prob.values[:len(sf)])
-        ca = corr(sf.values, target_alloc.values[:len(sf)])
+        cp = corr(sf.values, target_prob.values)
+        ca = corr(sf.values, target_alloc.values)
         base = c.replace("num__", "")
         rows.append({
             "feature": base,
