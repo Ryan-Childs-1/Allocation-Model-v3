@@ -1,50 +1,26 @@
-# Allocation AI Streamlit App · Base Model v1 + Base Model v2
+# Allocation AI Two-Model Streamlit App
 
-This package is a flat Streamlit deployment folder that includes two selectable model versions:
+This Streamlit app runs the latest Base Allocation and Base Review NumPy-only models exported from the Keras trainer with negative-row mixing and expanded demand features.
 
-- **Base Model v1**: the existing uploaded NumPy-only Base Allocation + Base Review model pair.
-- **Base Model v2**: the new uploaded v8 Base Allocation + Base Review model pair with counterfactual augmentation, store behavior memory, DC scarcity, reason-code heads, and Review recall recovery where present.
+## Runtime dependencies
 
-The app intentionally does **not** require scikit-learn, TensorFlow, Keras, or SciPy at runtime. It uses NumPy-only joblib model bundles.
+The app intentionally does **not** require scikit-learn, TensorFlow, Keras, or SciPy.
 
-## Run locally
+## Included models
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+- `base_allocation_numpy_model.joblib` — Base Allocation model for rows flagged Allocate.
+- `base_review_numpy_model.joblib` — Base Review model for rows flagged Review.
 
-## Streamlit Cloud entrypoint
-
-Use:
-
-```text
-app.py
-```
-
-## Model selection
-
-Use the sidebar dropdown named **Choose base model** to select:
-
-- `Base Model v1 · Existing uploaded model`
-- `Base Model v2 · New v8 recall/scarcity/memory model`
-
-## File naming
-
-All model artifacts have unique prefixes so v1 and v2 do not overwrite each other:
-
-- `base_model_v1_*`
-- `base_model_v2_*`
-
-See `MODEL_FILE_MANIFEST.md` for the complete upload list.
+Both models are NumPy-only bundles and can run on Streamlit Cloud without ML framework installs.
 
 ## Outputs
 
-After prediction, the app provides:
+- completed allocation CSV
+- allocation audit CSV
+- prediction summary JSON
+- feature importance CSV
+- feature relationship CSV
 
-- `completed_allocation.csv`
-- `allocation_audit.csv`
-- `prediction_summary.json`
-- `model_feature_importance.csv`
-- `prediction_feature_relationships.csv`
-- a combined output ZIP
+## Notes
+
+The app includes the newer demand-focused feature engineering around L30, D30, D60, LW, TTM, projected demand, demand acceleration, demand consistency, and demand-to-supply coverage.
