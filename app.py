@@ -47,6 +47,10 @@ VALIDATION_FILES = {
     "Base Allocation": BASE_DIR / "base_allocation_validation_predictions.csv",
     "Base Review": BASE_DIR / "base_review_validation_predictions.csv",
 }
+BACKTEST_FILES = {
+    "Base Allocation": BASE_DIR / "base_allocation_workbook_backtest.json",
+    "Base Review": BASE_DIR / "base_review_workbook_backtest.json",
+}
 SUMMARY_FILE = BASE_DIR / "base_allocation_base_review_summary.json"
 
 
@@ -87,7 +91,13 @@ def _metric_dict(meta: dict) -> dict:
         "unit_mae": best.get("unit_mae"),
         "false_positive_rate": best.get("false_positive_rate"),
         "priority_spread": priority.get("priority_spread_pos_minus_neg"),
+        "priority_mean_positive": priority.get("priority_mean_positive"),
+        "priority_mean_negative": priority.get("priority_mean_negative"),
         "model_file_mb": meta.get("model_file_mb"),
+        "quantity_correction_enabled": meta.get("quantity_correction_enabled"),
+        "override_detector_enabled": meta.get("override_detector_enabled"),
+        "negative_rows_total": meta.get("negative_rows_total"),
+        "no_alloc_negative_mixing_enabled": meta.get("no_alloc_negative_mixing_enabled"),
     }
 
 
@@ -145,6 +155,11 @@ with st.sidebar:
     st.header("Performance")
     chunk_size = st.select_slider("Prediction chunk size", options=[500, 1000, 2500, 5000, 10000], value=2500)
 
+    st.header("Advanced v7 controls")
+    use_dc_optimizer = st.checkbox("Use DC allocation optimizer", value=True)
+    use_quantity_correction = st.checkbox("Use quantity correction model", value=True)
+    use_override_detector = st.checkbox("Use override detector", value=True)
+
     with st.expander("What do these settings mean?", expanded=True):
         st.markdown(
             """
@@ -169,11 +184,17 @@ with st.sidebar:
             **Minimum Review priority for below-FLM leftover**: Minimum blended Review score required before the leftover is assigned.
 
             **Prediction chunk size**: Controls how many rows are scored at once. Smaller values use less memory; larger values can be faster.
+
+            **Use DC allocation optimizer**: Processes each section by model priority instead of simple row order, so scarce DC is consumed by the strongest rows first while the output still preserves original row order.
+
+            **Use quantity correction model**: Applies the v7 second-stage quantity model, which can adjust predicted FLM units up or down before simulation.
+
+            **Use override detector**: Uses the v7 auxiliary override signal in the audit output to show when the model believes workbook recommendation behavior may be overridden.
             """
         )
 
 st.title(APP_TITLE)
-st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system. This version runs with NumPy-only model bundles exported from the latest trainer and does not install scikit-learn or TensorFlow.")
+st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system. This version runs with NumPy-only v7 model bundles exported from the latest trainer and does not install scikit-learn, TensorFlow, or Keras.")
 
 predict_tab, insights_tab, model_tab, process_tab = st.tabs([
     "Predict Allocation",
@@ -212,6 +233,9 @@ with predict_tab:
                     review_partial_leftover_to_single_row=bool(partial_single),
                     review_partial_leftover_min_priority=float(partial_min_priority),
                     prediction_chunk_size=int(chunk_size),
+                    use_dc_optimizer=bool(use_dc_optimizer),
+                    use_quantity_correction=bool(use_quantity_correction),
+                    use_override_detector=bool(use_override_detector),
                 )
                 with st.spinner("Loading models, scoring Allocate/Review sections, and simulating DC availability..."):
                     models = cached_models()
@@ -377,12 +401,30 @@ with model_tab:
         c3.metric("Threshold", _fmt(m.get("best_threshold"), 2))
         c4.metric("Model size MB", _fmt(m.get("model_file_mb"), 2))
 
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("Positive rows", f"{int(m.get('positive_rows_total') or 0):,}")
+        x2.metric("Negative rows", f"{int(m.get('negative_rows_total') or 0):,}")
+        x3.metric("Quantity correction", "On" if m.get("quantity_correction_enabled") else "Off")
+        x4.metric("Override detector", "On" if m.get("override_detector_enabled") else "Off")
+
         p1, p2, p3, p4, p5 = st.columns(5)
         p1.metric("F1", _fmt(m.get("f1")))
         p2.metric("Precision", _fmt(m.get("precision")))
         p3.metric("Recall", _fmt(m.get("recall")))
         p4.metric("Unit accuracy", _fmt(m.get("unit_accuracy")))
         p5.metric("Unit MAE", _fmt(m.get("unit_mae"), 4))
+
+        backtest = read_json(BACKTEST_FILES.get(label, Path("")))
+        if backtest:
+            st.markdown("#### Workbook-like backtest")
+            b1, b2, b3, b4, b5 = st.columns(5)
+            b1.metric("Exact match", _fmt(backtest.get("row_exact_match")))
+            b2.metric("Near match", _fmt(backtest.get("row_near_match")))
+            b3.metric("Unit MAE", _fmt(backtest.get("unit_mae"), 4))
+            b4.metric("Predicted units", f"{int(backtest.get('predicted_total_units') or 0):,}")
+            b5.metric("Actual units", f"{int(backtest.get('actual_total_units') or 0):,}")
+            with st.expander("Backtest JSON", expanded=False):
+                st.json(backtest)
 
         sweep = _read_csv(SWEEP_FILES[label])
         if not sweep.empty:
@@ -428,19 +470,20 @@ with process_tab:
         5. Rows that are not Allocate or Review are ignored and left blank.
         6. The app simulates remaining DC by item while filling Final Alloc.
         7. Review rows are ranked by a blend of model priority, model probability, and need so the most important review rows consume scarce DC first.
-        8. The output is a completed CSV plus an audit CSV and explanation tables.
+        8. The v7 system can apply a quantity-correction model, override detector, and DC allocation optimizer before writing Final Alloc.
+        9. The output is a completed CSV plus an audit CSV and explanation tables.
         """
     )
 
     st.markdown("### Core model features")
     feature_groups = pd.DataFrame([
-        {"Feature group": "Demand / velocity", "Examples": "L30, D30, D60, LW, TTM, projected demand, recent velocity blend"},
+        {"Feature group": "Demand / velocity", "Examples": "L30, D30, D60, LW, TTM, projected demand, recent velocity blend, demand acceleration, demand consistency, spike/decline flags"},
         {"Feature group": "Supply / DC", "Examples": "QOH, supply, DC available, Left DC, reconstructed DC before Final Alloc"},
         {"Feature group": "Allocation recommendation", "Examples": "Alloc. Rec., Alloc. Rec. units, Alloc. Rec. to need/DC/projection ratios"},
         {"Feature group": "Need / scarcity", "Examples": "Need gap, demand cap, need-to-DC pressure, DC-to-need ratio"},
         {"Feature group": "Section/group context", "Examples": "Item totals, site totals, department/class totals, item-section totals"},
         {"Feature group": "Ranking", "Examples": "Within-item rank by need, demand, Alloc. Rec., DC-before, and velocity"},
-        {"Feature group": "Workbook helper logic", "Examples": "Demand Check, Helper, Final Supply, FLM, partial leftover indicators"},
+        {"Feature group": "Workbook helper logic", "Examples": "Demand Check, Helper, Final Supply, FLM, partial leftover indicators, quantity correction, override detector signals"},
         {"Feature group": "Categorical identity", "Examples": "Item, UPC, site, description, department, class, region, flag"},
     ])
     st.dataframe(feature_groups, use_container_width=True, hide_index=True)

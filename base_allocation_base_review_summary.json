@@ -1,5 +1,5 @@
 {
-  "artifact_short_name": "base_allocation_review_v3_negative_demand",
+  "artifact_short_name": "base_allocation_review_v7_optimizer_backtest",
   "backend": "two_model_keras_numpy_export_trainer",
   "models": {
     "allocate": {
@@ -13,33 +13,40 @@
       "negative_rows_total": 581,
       "no_alloc_negative_mixing_enabled": true,
       "no_alloc_negative_ratio": 0.55,
-      "best_epoch": 2,
+      "best_epoch": 54,
       "best_threshold": 0.01,
       "threshold_modes": {
         "balanced": 0.01,
-        "conservative": 0.95,
+        "conservative": 0.01,
         "aggressive": 0.01,
-        "max_precision": 0.95,
+        "max_precision": 0.01,
         "max_recall": 0.01
       },
       "best_validation_metrics": {
         "threshold": 0.01,
-        "precision": 0.8733205374280231,
-        "recall": 1.0,
-        "f1": 0.9323770491803279,
-        "unit_accuracy": 0.5659655831739961,
-        "positive_unit_accuracy": 0.6461538461538462,
-        "unit_mae": 0.47418738049713194,
-        "false_positive_rate": 0.9705882352941176,
-        "predicted_positive_rows": 521.0,
+        "precision": 0.9953703703703703,
+        "recall": 0.945054945054945,
+        "f1": 0.9695603156708004,
+        "unit_accuracy": 0.6347992351816444,
+        "positive_unit_accuracy": 0.5846153846153846,
+        "unit_mae": 0.4168260038240918,
+        "false_positive_rate": 0.029411764705882353,
+        "predicted_positive_rows": 432.0,
         "actual_positive_rows": 455.0
       },
       "priority_validation_summary": {
-        "priority_mean_positive": 0.760967493057251,
-        "priority_mean_negative": 0.7149312496185303
+        "priority_mean_positive": 0.6837552189826965,
+        "priority_mean_negative": 0.14645916223526
       },
+      "override_detector_summary": {
+        "override_prob_mean": 0.20300473272800446,
+        "override_prob_positive_mean": 0.08402439206838608,
+        "override_prob_negative_mean": 0.9991232752799988
+      },
+      "quantity_correction_enabled": true,
+      "override_detector_enabled": true,
       "config": {
-        "artifact_short_name": "base_allocation_review_v3_negative_demand",
+        "artifact_short_name": "base_allocation_review_v7_optimizer_backtest",
         "max_units": 240,
         "validation_size": 0.2,
         "random_state": 42,
@@ -111,6 +118,24 @@
         ],
         "review_priority_boost": 1.35,
         "unit_near_miss_tolerance": 1,
+        "use_quantity_correction_model": true,
+        "quantity_correction_layers": [
+          128,
+          64,
+          32
+        ],
+        "quantity_correction_classes": 7,
+        "use_override_detector": true,
+        "override_detector_layers": [
+          128,
+          64,
+          32
+        ],
+        "run_optimizer_backtest": true,
+        "optimizer_priority_weight": 0.55,
+        "optimizer_probability_weight": 0.25,
+        "optimizer_need_weight": 0.15,
+        "optimizer_alloc_rec_weight": 0.05,
         "export_validation_predictions": true,
         "run_workbook_backtest": true,
         "threshold_grid": [
@@ -127,10 +152,20 @@
           0.95
         ]
       },
-      "trained_at_unix": 1780625924.564865,
+      "trained_at_unix": 1780627261.148266,
       "streamlit_runtime": "numpy_only_no_tensorflow_no_sklearn",
-      "model_file_mb": 6.38602352142334,
-      "model_under_size_cap": true
+      "model_file_mb": 9.52400016784668,
+      "model_under_size_cap": true,
+      "workbook_like_backtest": {
+        "section": "allocate",
+        "rows": 523,
+        "row_exact_match": 0.6347992351816444,
+        "row_near_match": 0.9579349904397706,
+        "unit_mae": 0.4168260038240918,
+        "predicted_total_units": 663,
+        "actual_total_units": 519,
+        "total_units_error": 144
+      }
     },
     "review": {
       "model_name": "Base Review",
@@ -143,33 +178,40 @@
       "negative_rows_total": 5529,
       "no_alloc_negative_mixing_enabled": true,
       "no_alloc_negative_ratio": 0.85,
-      "best_epoch": 17,
-      "best_threshold": 0.03,
+      "best_epoch": 35,
+      "best_threshold": 0.01,
       "threshold_modes": {
-        "balanced": 0.03,
-        "conservative": 0.03,
-        "aggressive": 0.03,
-        "max_precision": 0.03,
-        "max_recall": 0.03
+        "balanced": 0.01,
+        "conservative": 0.01,
+        "aggressive": 0.01,
+        "max_precision": 0.01,
+        "max_recall": 0.01
       },
       "best_validation_metrics": {
-        "threshold": 0.03,
-        "precision": 0.5357142857142857,
-        "recall": 0.5172413793103449,
-        "f1": 0.5263157894736843,
-        "unit_accuracy": 0.8208955223880597,
-        "positive_unit_accuracy": 0.5333333333333333,
-        "unit_mae": 0.1865671641791045,
-        "false_positive_rate": 0.12380952380952381,
-        "predicted_positive_rows": 56.0,
+        "threshold": 0.01,
+        "precision": 1.0,
+        "recall": 0.15517241379310345,
+        "f1": 0.26865671641791045,
+        "unit_accuracy": 0.8656716417910447,
+        "positive_unit_accuracy": 0.2,
+        "unit_mae": 0.16044776119402984,
+        "false_positive_rate": 0.0,
+        "predicted_positive_rows": 9.0,
         "actual_positive_rows": 58.0
       },
       "priority_validation_summary": {
-        "priority_mean_positive": 0.889475405216217,
-        "priority_mean_negative": 0.4961240589618683
+        "priority_mean_positive": 0.7741346955299377,
+        "priority_mean_negative": 0.3658406436443329
       },
+      "override_detector_summary": {
+        "override_prob_mean": 0.977757453918457,
+        "override_prob_positive_mean": 0.8979448676109314,
+        "override_prob_negative_mean": 0.9998010396957397
+      },
+      "quantity_correction_enabled": true,
+      "override_detector_enabled": true,
       "config": {
-        "artifact_short_name": "base_allocation_review_v3_negative_demand",
+        "artifact_short_name": "base_allocation_review_v7_optimizer_backtest",
         "max_units": 240,
         "validation_size": 0.2,
         "random_state": 42,
@@ -241,6 +283,24 @@
         ],
         "review_priority_boost": 1.35,
         "unit_near_miss_tolerance": 1,
+        "use_quantity_correction_model": true,
+        "quantity_correction_layers": [
+          128,
+          64,
+          32
+        ],
+        "quantity_correction_classes": 7,
+        "use_override_detector": true,
+        "override_detector_layers": [
+          128,
+          64,
+          32
+        ],
+        "run_optimizer_backtest": true,
+        "optimizer_priority_weight": 0.55,
+        "optimizer_probability_weight": 0.25,
+        "optimizer_need_weight": 0.15,
+        "optimizer_alloc_rec_weight": 0.05,
         "export_validation_predictions": true,
         "run_workbook_backtest": true,
         "threshold_grid": [
@@ -257,12 +317,22 @@
           0.95
         ]
       },
-      "trained_at_unix": 1780625965.823051,
+      "trained_at_unix": 1780627341.252862,
       "streamlit_runtime": "numpy_only_no_tensorflow_no_sklearn",
-      "model_file_mb": 5.6348981857299805,
-      "model_under_size_cap": true
+      "model_file_mb": 7.765411376953125,
+      "model_under_size_cap": true,
+      "workbook_like_backtest": {
+        "section": "review",
+        "rows": 268,
+        "row_exact_match": 0.8656716417910447,
+        "row_near_match": 0.9813432835820896,
+        "unit_mae": 0.16044776119402984,
+        "predicted_total_units": 9,
+        "actual_total_units": 52,
+        "total_units_error": -43
+      }
     }
   },
-  "trained_at_unix": 1780625966.2611752,
+  "trained_at_unix": 1780627342.882268,
   "streamlit_runtime": "numpy_only_no_tensorflow_no_sklearn"
 }

@@ -24,3 +24,7 @@ Both models are NumPy-only bundles and can run on Streamlit Cloud without ML fra
 ## Notes
 
 The app includes the newer demand-focused feature engineering around L30, D30, D60, LW, TTM, projected demand, demand acceleration, demand consistency, and demand-to-supply coverage.
+
+
+## v7 model update
+This package includes the v7 optimizer/backtest NumPy-only Base Allocation and Base Review models with quantity correction, override detector metadata, workbook-like backtests, and expanded demand-pattern features.
