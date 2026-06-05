@@ -2,52 +2,73 @@
   "model_name": "Base Review",
   "section": "review",
   "backend": "keras_to_numpy",
-  "rows_total": 7579,
-  "rows_train": 7311,
+  "rows_total": 10137,
+  "rows_train": 9869,
   "rows_validation": 268,
   "positive_rows_total": 2050,
-  "negative_rows_total": 5529,
+  "negative_rows_total": 8087,
   "no_alloc_negative_mixing_enabled": true,
   "no_alloc_negative_ratio": 0.85,
-  "best_epoch": 35,
-  "best_threshold": 0.01,
+  "counterfactual_augmentation_enabled": true,
+  "store_behavior_memory_enabled": true,
+  "store_memory_site_count": 147,
+  "best_epoch": 25,
+  "best_threshold": 0.95,
   "threshold_modes": {
-    "balanced": 0.01,
-    "conservative": 0.01,
-    "aggressive": 0.01,
-    "max_precision": 0.01,
-    "max_recall": 0.01
+    "balanced": 0.95,
+    "conservative": 0.95,
+    "aggressive": 0.95,
+    "max_precision": 0.95,
+    "max_recall": 0.95
   },
   "best_validation_metrics": {
-    "threshold": 0.01,
+    "threshold": 0.95,
     "precision": 1.0,
-    "recall": 0.15517241379310345,
-    "f1": 0.26865671641791045,
-    "unit_accuracy": 0.8656716417910447,
-    "positive_unit_accuracy": 0.2,
-    "unit_mae": 0.16044776119402984,
+    "recall": 0.1896551724137931,
+    "f1": 0.3188405797101449,
+    "unit_accuracy": 0.8694029850746269,
+    "positive_unit_accuracy": 0.2222222222222222,
+    "unit_mae": 0.15298507462686567,
     "false_positive_rate": 0.0,
-    "predicted_positive_rows": 9.0,
+    "predicted_positive_rows": 11.0,
     "actual_positive_rows": 58.0
   },
   "priority_validation_summary": {
-    "priority_mean_positive": 0.7741346955299377,
-    "priority_mean_negative": 0.3658406436443329
+    "priority_mean_positive": 0.5753085017204285,
+    "priority_mean_negative": 0.29178938269615173
   },
   "override_detector_summary": {
-    "override_prob_mean": 0.977757453918457,
-    "override_prob_positive_mean": 0.8979448676109314,
-    "override_prob_negative_mean": 0.9998010396957397
+    "override_prob_mean": 0.9945819973945618,
+    "override_prob_positive_mean": 0.9749833345413208,
+    "override_prob_negative_mean": 0.9999950528144836
+  },
+  "scarcity_mode_summary": {
+    "0": 209,
+    "1": 38,
+    "2": 14,
+    "3": 7
+  },
+  "reason_code_summary": {
+    "0": 0,
+    "1": 0,
+    "2": 0,
+    "3": 120,
+    "4": 0,
+    "5": 39,
+    "6": 109
   },
   "quantity_correction_enabled": true,
   "override_detector_enabled": true,
+  "review_recall_recovery_enabled": true,
+  "dc_scarcity_model_enabled": true,
+  "reason_code_model_enabled": true,
   "config": {
-    "artifact_short_name": "base_allocation_review_v7_optimizer_backtest",
+    "artifact_short_name": "base_allocation_review_v8_recall_scarcity_memory",
     "max_units": 240,
     "validation_size": 0.2,
     "random_state": 42,
     "validation_method": "holdout_by_file",
-    "cached_dataset_path": "cache/two_model_advanced_training_dataset.pkl",
+    "cached_dataset_path": "two_model_advanced_training_dataset.pkl",
     "rebuild_dataset": false,
     "legacy_cached_dataset_paths": [
       "two_mlp_allocate_review_training_dataset.pkl",
@@ -132,6 +153,32 @@
     "optimizer_probability_weight": 0.25,
     "optimizer_need_weight": 0.15,
     "optimizer_alloc_rec_weight": 0.05,
+    "use_review_recall_recovery_model": true,
+    "review_recall_recovery_layers": [
+      160,
+      80,
+      40
+    ],
+    "review_recall_recovery_threshold": 0.25,
+    "use_dc_scarcity_model": true,
+    "dc_scarcity_layers": [
+      128,
+      64,
+      32
+    ],
+    "scarcity_threshold_adjustment": 0.1,
+    "use_reason_code_model": true,
+    "reason_code_layers": [
+      128,
+      64,
+      32
+    ],
+    "reason_code_classes": 7,
+    "use_store_behavior_memory": true,
+    "store_memory_min_rows": 3,
+    "use_counterfactual_augmentation": true,
+    "counterfactual_fraction": 0.35,
+    "counterfactual_max_rows_per_section": 60000,
     "export_validation_predictions": true,
     "run_workbook_backtest": true,
     "threshold_grid": [
@@ -148,8 +195,8 @@
       0.95
     ]
   },
-  "trained_at_unix": 1780627341.252862,
+  "trained_at_unix": 1780628601.374645,
   "streamlit_runtime": "numpy_only_no_tensorflow_no_sklearn",
-  "model_file_mb": 7.765411376953125,
+  "model_file_mb": 11.346980094909668,
   "model_under_size_cap": true
 }

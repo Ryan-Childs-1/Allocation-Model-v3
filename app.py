@@ -1,512 +1,752 @@
-from __future__ import annotations
 
 import io
 import json
+import math
+import re
 import zipfile
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from data_io import dataframe_to_csv_bytes, read_allocation_file, save_upload
-from schema import ColumnDiagnostics, build_column_map
-from two_model_prediction_system import (
-    TwoPredictionConfig,
-    load_two_models,
-    model_feature_importance,
-    predict_allocation_file,
-    prediction_feature_relationships,
-    read_json,
+# Optional Excel writer/reader helpers
+try:
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+except Exception:
+    load_workbook = None
+
+
+# ============================================================
+# Base Model v1/v2 Allocation Streamlit App
+# ------------------------------------------------------------
+# Purpose:
+# - Upload allocation workbook/CSV.
+# - Select Base Model v1 or Base Model v2.
+# - Fill Final Alloc. only.
+# - Preserve blanks where rows should not be allocated.
+# - Return a downloadable result file plus an audit summary.
+#
+# Key business assumptions from allocation AI design:
+# - BR = Flag
+# - BS = Final Alloc.
+# - BN = Alloc. Rec.
+# - BM = Proj. Demand
+# - BT = Left DC / remaining units
+# - BU = Final Supply
+# - BK = FLM
+# - AP = QOH
+# - AQ = Supply
+# - AK/AL/AM/AN/AO = L30/D30/D60/LW/TTM
+# - Include Allocate, Review, and Z - No Alloc rows as candidates.
+# - Use three passes.
+# - No hard cap on number of FLMs per pass or total.
+# - Round to FLM, but allow remainder allocation when Left DC is below one FLM.
+# - Blank FLM defaults to 1.
+# ============================================================
+
+
+st.set_page_config(
+    page_title="Allocation AI — Base Model v1/v2",
+    page_icon="📦",
+    layout="wide",
 )
 
-st.set_page_config(page_title="Allocation AI · Base Allocation + Base Review · sklearn-free", page_icon="🎯", layout="wide")
+APP_VERSION = "Base Model v1/v2 Streamlit App — Completed"
+DEFAULT_SHEET_INDEX = 0
 
-APP_TITLE = "🎯 Allocation AI · Two-Model Predictor"
-ARTIFACT_NAME = "Base Allocation + Base Review"
-BASE_DIR = Path(__file__).parent if "__file__" in globals() else Path(".")
 
-MODEL_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_numpy_model.joblib",
-    "Base Review": BASE_DIR / "base_review_numpy_model.joblib",
+COLUMN_LETTERS = {
+    "O": 15,
+    "AK": 37,
+    "AL": 38,
+    "AM": 39,
+    "AN": 40,
+    "AO": 41,
+    "AP": 42,
+    "AQ": 43,
+    "BJ": 62,
+    "BK": 63,
+    "BM": 65,
+    "BN": 66,
+    "BR": 70,
+    "BS": 71,
+    "BT": 72,
+    "BU": 73,
+    "CA": 79,
+    "CB": 80,
 }
-METADATA_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_model_metadata.json",
-    "Base Review": BASE_DIR / "base_review_model_metadata.json",
+
+
+SYNONYMS = {
+    "group_key": ["Matching Group", "Matching group", "Group", "Item", "UPC", "Line Id", "Line ID", "SKU", "O"],
+    "l30": ["L30", "L30 Sales", "Last 30", "Last 30 Days", "AK"],
+    "d30": ["D30", "D30 Demand", "Demand 30", "AL"],
+    "d60": ["D60", "Demand 60", "60 Day Demand", "AM"],
+    "lw": ["LW", "LW Sales", "Last Week", "AN"],
+    "ttm": ["TTM", "TTM Sales", "Trailing 12", "AO"],
+    "qoh": ["QOH", "Qty On Hand", "Quantity on Hand", "AP"],
+    "supply": ["Supply", "Supply on Hand", "SOH", "AQ"],
+    "mil": ["MIL", "Min Inv Level", "Minimum Inventory Level", "BJ"],
+    "flm": ["FLM", "Allocation Unit", "Pack", "Pack Multiple", "BK"],
+    "proj_demand": ["Proj. Demand", "Projected Demand", "Proj Demand", "BM"],
+    "alloc_rec": ["Alloc. Rec.", "Alloc Rec", "Allocation Recommendation", "BN"],
+    "flag": ["Flag", "Review Flag", "BR"],
+    "final_alloc": ["Final Alloc.", "Final Alloc", "Final Allocation", "BS"],
+    "left_dc": ["Left DC", "Left in DC", "Left-in-DC", "DC Avail", "Remaining DC", "BT"],
+    "final_supply": ["Final Supply", "Final Supply Units", "BU"],
+    "demand_discount": ["Demand Discount", "Demand Disc", "CA"],
+    "base_demand": ["New Base Demand", "Base Demand", "CB"],
 }
-SWEEP_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_threshold_sweep.csv",
-    "Base Review": BASE_DIR / "base_review_threshold_sweep.csv",
+
+
+@dataclass
+class ModelConfig:
+    name: str
+    description: str
+    demand_weight: float
+    alloc_rec_weight: float
+    min_need_weight: float
+    review_multiplier: float
+    z_no_alloc_multiplier: float
+    safety_stock_weight: float
+    overstock_buffer_flm: float
+    demand_discount_weight: float
+    pass_multipliers: Tuple[float, float, float]
+
+
+MODEL_CONFIGS = {
+    "Base Model v1": ModelConfig(
+        name="Base Model v1",
+        description=(
+            "Conservative baseline built from the Version 6 logic. "
+            "Uses projected demand, allocation recommendation, current supply, FLM rounding, "
+            "and demand-protective caps."
+        ),
+        demand_weight=0.74,
+        alloc_rec_weight=0.68,
+        min_need_weight=0.30,
+        review_multiplier=0.55,
+        z_no_alloc_multiplier=0.35,
+        safety_stock_weight=0.18,
+        overstock_buffer_flm=1.00,
+        demand_discount_weight=0.35,
+        pass_multipliers=(0.70, 0.90, 1.00),
+    ),
+    "Base Model v2": ModelConfig(
+        name="Base Model v2",
+        description=(
+            "Improved baseline built from the Version 8 design. "
+            "More advanced demand blend, stronger use of BM/BN, includes Z - No Alloc opportunity rows, "
+            "and is more willing to allocate when demand support is broad."
+        ),
+        demand_weight=0.92,
+        alloc_rec_weight=0.82,
+        min_need_weight=0.42,
+        review_multiplier=0.72,
+        z_no_alloc_multiplier=0.52,
+        safety_stock_weight=0.26,
+        overstock_buffer_flm=1.15,
+        demand_discount_weight=0.50,
+        pass_multipliers=(0.85, 1.05, 1.20),
+    ),
 }
-PROGRESS_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_training_progress.csv",
-    "Base Review": BASE_DIR / "base_review_training_progress.csv",
-}
-VALIDATION_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_validation_predictions.csv",
-    "Base Review": BASE_DIR / "base_review_validation_predictions.csv",
-}
-BACKTEST_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_workbook_backtest.json",
-    "Base Review": BASE_DIR / "base_review_workbook_backtest.json",
-}
-SUMMARY_FILE = BASE_DIR / "base_allocation_base_review_summary.json"
 
 
-@st.cache_resource(show_spinner=False)
-def cached_models():
-    return load_two_models(BASE_DIR)
+def excel_col_name(n: int) -> str:
+    name = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        name = chr(65 + rem) + name
+    return name
 
 
-@st.cache_data(show_spinner=False)
-def load_metadata():
-    return {label: read_json(path) for label, path in METADATA_FILES.items()}, read_json(SUMMARY_FILE)
+def normalize_name(x) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(x).strip().lower())
 
 
-def _fmt(x, digits=3, default="—"):
+def to_number(series_or_value, default=0.0):
+    if isinstance(series_or_value, pd.Series):
+        s = series_or_value.copy()
+        s = s.replace({"-": np.nan, "": np.nan, " ": np.nan})
+        if s.dtype == object:
+            s = s.astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+        return pd.to_numeric(s, errors="coerce").fillna(default)
     try:
-        if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        if pd.isna(series_or_value):
             return default
-        return f"{float(x):.{digits}f}"
+        if isinstance(series_or_value, str):
+            clean = series_or_value.replace("$", "").replace(",", "").replace("%", "").strip()
+            if clean in ("", "-"):
+                return default
+            return float(clean)
+        return float(series_or_value)
     except Exception:
         return default
 
 
-def _metric_dict(meta: dict) -> dict:
-    best = meta.get("best_validation_metrics", {}) if isinstance(meta, dict) else {}
-    priority = meta.get("priority_validation_summary", {}) if isinstance(meta, dict) else {}
-    return {
-        "rows_total": meta.get("rows_total"),
-        "rows_train": meta.get("rows_train"),
-        "rows_validation": meta.get("rows_validation"),
-        "positive_rows_total": meta.get("positive_rows_total"),
-        "best_epoch": meta.get("best_epoch"),
-        "best_threshold": meta.get("best_threshold", best.get("threshold")),
-        "f1": best.get("f1"),
-        "precision": best.get("precision"),
-        "recall": best.get("recall"),
-        "unit_accuracy": best.get("unit_accuracy"),
-        "positive_unit_accuracy": best.get("positive_unit_accuracy"),
-        "unit_mae": best.get("unit_mae"),
-        "false_positive_rate": best.get("false_positive_rate"),
-        "priority_spread": priority.get("priority_spread_pos_minus_neg"),
-        "priority_mean_positive": priority.get("priority_mean_positive"),
-        "priority_mean_negative": priority.get("priority_mean_negative"),
-        "model_file_mb": meta.get("model_file_mb"),
-        "quantity_correction_enabled": meta.get("quantity_correction_enabled"),
-        "override_detector_enabled": meta.get("override_detector_enabled"),
-        "negative_rows_total": meta.get("negative_rows_total"),
-        "no_alloc_negative_mixing_enabled": meta.get("no_alloc_negative_mixing_enabled"),
+def safe_str_series(s: pd.Series) -> pd.Series:
+    return s.fillna("").astype(str)
+
+
+def find_col(df: pd.DataFrame, key: str) -> Optional[str]:
+    cols = list(df.columns)
+    normalized_cols = {normalize_name(c): c for c in cols}
+
+    # 1) Synonym match
+    for cand in SYNONYMS.get(key, []):
+        n = normalize_name(cand)
+        if n in normalized_cols:
+            return normalized_cols[n]
+
+    # 2) Partial match
+    for cand in SYNONYMS.get(key, []):
+        nc = normalize_name(cand)
+        for c in cols:
+            if nc and (nc in normalize_name(c) or normalize_name(c) in nc):
+                return c
+
+    # 3) Excel letter fallback by physical position
+    for cand in SYNONYMS.get(key, []):
+        cand_upper = str(cand).upper()
+        if cand_upper in COLUMN_LETTERS:
+            pos = COLUMN_LETTERS[cand_upper] - 1
+            if 0 <= pos < len(cols):
+                return cols[pos]
+
+    return None
+
+
+def build_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    return {key: find_col(df, key) for key in SYNONYMS.keys()}
+
+
+def read_uploaded_file(uploaded_file, sheet_name=None) -> Tuple[pd.DataFrame, Dict]:
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+    meta = {"filename": uploaded_file.name, "input_type": None, "sheet_name": sheet_name}
+
+    if name.endswith(".csv"):
+        meta["input_type"] = "csv"
+        df = pd.read_csv(io.BytesIO(raw), dtype=object)
+        return df, meta
+
+    if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        meta["input_type"] = "xlsx"
+        xl = pd.ExcelFile(io.BytesIO(raw), engine="openpyxl")
+        use_sheet = sheet_name if sheet_name is not None else xl.sheet_names[DEFAULT_SHEET_INDEX]
+        meta["sheet_name"] = use_sheet
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=use_sheet, dtype=object, engine="openpyxl")
+        meta["raw_bytes"] = raw
+        return df, meta
+
+    if name.endswith(".xlsb"):
+        meta["input_type"] = "xlsb"
+        # pyxlsb is required by requirements.txt. Streamlit Cloud will install it.
+        xl = pd.ExcelFile(io.BytesIO(raw), engine="pyxlsb")
+        use_sheet = sheet_name if sheet_name is not None else xl.sheet_names[DEFAULT_SHEET_INDEX]
+        meta["sheet_name"] = use_sheet
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=use_sheet, dtype=object, engine="pyxlsb")
+        return df, meta
+
+    raise ValueError("Unsupported file type. Upload CSV, XLSX, XLSM, or XLSB.")
+
+
+def get_sheet_names(uploaded_file) -> List[str]:
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.getvalue()
+    if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        return pd.ExcelFile(io.BytesIO(raw), engine="openpyxl").sheet_names
+    if name.endswith(".xlsb"):
+        return pd.ExcelFile(io.BytesIO(raw), engine="pyxlsb").sheet_names
+    return []
+
+
+def mround_to_flm(value: float, flm: float, left: float) -> int:
+    value = max(0.0, float(value))
+    left = max(0.0, float(left))
+    flm = max(1.0, float(flm))
+
+    if left <= 0 or value <= 0:
+        return 0
+
+    # Critical business rule: if remaining DC is below one FLM, allow remaining units.
+    if left < flm:
+        return int(math.floor(left))
+
+    rounded = int(round(value / flm) * flm)
+    if rounded <= 0 and value >= max(1, flm * 0.35):
+        rounded = int(flm)
+
+    rounded = min(rounded, int(math.floor(left)))
+    if rounded >= flm:
+        rounded = int(math.floor(rounded / flm) * flm)
+    return max(0, int(rounded))
+
+
+def demand_blend(row, cmap, cfg: ModelConfig) -> float:
+    def val(k):
+        col = cmap.get(k)
+        return to_number(row[col]) if col and col in row.index else 0.0
+
+    l30 = val("l30")
+    d30 = val("d30")
+    d60 = val("d60")
+    lw = val("lw")
+    ttm = val("ttm")
+    bm = val("proj_demand")
+    bn = val("alloc_rec")
+    mil = val("mil")
+    ca = val("demand_discount")
+    cb = val("base_demand")
+
+    components = [
+        l30 * 1.18,
+        d30 * 0.90,
+        d60 * 0.55,
+        lw * 4.29,
+        ttm / 12.0,
+        bm * 1.00 if bm > 0 else 0,
+        cb * 1.00 if cb > 0 else 0,
+    ]
+    positive = [x for x in components if x and x > 0]
+    if positive:
+        # Weighted robust demand: use both median and high percentile to avoid one noisy metric dominating.
+        median_part = float(np.median(positive))
+        high_part = float(np.percentile(positive, 70))
+        raw_demand = 0.55 * median_part + 0.45 * high_part
+    else:
+        raw_demand = 0.0
+
+    if bm > 0:
+        raw_demand = max(raw_demand, bm * cfg.demand_weight)
+
+    # Demand discount is typically a decimal that downweights underperforming stores.
+    # Treat 0/blank as neutral because historical files often leave it blank.
+    if ca > 0:
+        if ca <= 1.5:
+            raw_demand *= max(0.45, 1.0 - cfg.demand_discount_weight * max(0.0, 1.0 - ca))
+        else:
+            raw_demand *= max(0.45, min(1.15, ca / 100.0))
+
+    # BN is a strong signal but not allowed to blindly override demand protection.
+    if bn > 0:
+        raw_demand = max(raw_demand, bn * cfg.alloc_rec_weight)
+
+    # MIL gets partial weight only when there is some real demand signal.
+    if mil > 0 and (l30 + d30 + d60 + lw + ttm + bm + cb) > 0:
+        raw_demand = max(raw_demand, mil * cfg.min_need_weight)
+
+    return max(0.0, raw_demand)
+
+
+def row_candidate_status(flag_text: str) -> str:
+    f = str(flag_text or "").upper()
+    if "ALLOC" in f:
+        return "ALLOCATE"
+    if "REVIEW" in f:
+        return "REVIEW"
+    if "Z" in f and "NO" in f and "ALLOC" in f:
+        return "Z_NO_ALLOC"
+    if "NO ALLOC" in f:
+        return "Z_NO_ALLOC"
+    return "IGNORE"
+
+
+def compute_model_predictions(df: pd.DataFrame, cmap: Dict[str, Optional[str]], cfg: ModelConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    out = df.copy()
+    n = len(out)
+    pred = np.zeros(n, dtype=int)
+    pass_allocs = {1: np.zeros(n, dtype=int), 2: np.zeros(n, dtype=int), 3: np.zeros(n, dtype=int)}
+    reasons = [""] * n
+
+    # Required-ish columns with fallbacks
+    flag_col = cmap.get("flag")
+    final_col = cmap.get("final_alloc")
+    left_col = cmap.get("left_dc")
+    flm_col = cmap.get("flm")
+    supply_col = cmap.get("supply")
+    qoh_col = cmap.get("qoh")
+    final_supply_col = cmap.get("final_supply")
+    d60_col = cmap.get("d60")
+    ttm_col = cmap.get("ttm")
+    d30_col = cmap.get("d30")
+    l30_col = cmap.get("l30")
+    group_col = cmap.get("group_key")
+
+    flags = safe_str_series(out[flag_col]) if flag_col else pd.Series([""] * n)
+    left_dc = to_number(out[left_col], 0) if left_col else pd.Series([0] * n)
+    flm = to_number(out[flm_col], 1) if flm_col else pd.Series([1] * n)
+    flm = flm.where(flm > 0, 1)
+
+    qoh = to_number(out[qoh_col], 0) if qoh_col else pd.Series([0] * n)
+    supply = to_number(out[supply_col], 0) if supply_col else pd.Series([0] * n)
+    d60 = to_number(out[d60_col], 0) if d60_col else pd.Series([0] * n)
+    ttm = to_number(out[ttm_col], 0) if ttm_col else pd.Series([0] * n)
+    d30 = to_number(out[d30_col], 0) if d30_col else pd.Series([0] * n)
+    l30 = to_number(out[l30_col], 0) if l30_col else pd.Series([0] * n)
+
+    if group_col:
+        groups = safe_str_series(out[group_col]).replace("", "__NO_GROUP__")
+    else:
+        groups = pd.Series([f"row_{i}" for i in range(n)])
+
+    # Use max positive Left DC by group as available pool. This handles files where BT repeats per item/store row.
+    group_left = {}
+    for g, vals in left_dc.groupby(groups):
+        max_left = float(np.nanmax(vals.values)) if len(vals) else 0.0
+        group_left[g] = max(0.0, max_left)
+
+    # Rank rows inside each group by need so scarce DC units go to strongest stores first.
+    scoring_rows = []
+    raw_need = np.zeros(n, dtype=float)
+    status_list = []
+    for i, row in out.iterrows():
+        status = row_candidate_status(flags.iloc[i])
+        status_list.append(status)
+
+        if status == "IGNORE":
+            raw_need[i] = 0.0
+            continue
+
+        base_demand = demand_blend(row, cmap, cfg)
+        current_supply = max(0.0, qoh.iloc[i] + supply.iloc[i])
+        effective_need = max(0.0, base_demand - current_supply)
+
+        if status == "REVIEW":
+            effective_need *= cfg.review_multiplier
+        elif status == "Z_NO_ALLOC":
+            effective_need *= cfg.z_no_alloc_multiplier
+
+        # Mild safety stock if there is real recent demand and the store is at/near zero.
+        if current_supply <= 0 and (l30.iloc[i] + d30.iloc[i] + d60.iloc[i]) > 0:
+            effective_need += max(1.0, flm.iloc[i] * cfg.safety_stock_weight)
+
+        raw_need[i] = effective_need
+        scoring_rows.append((groups.iloc[i], i, effective_need))
+
+    # Sort per group by need descending, but keep stable row order as tie-breaker.
+    sorted_indices_by_group = {}
+    for g, i, need in scoring_rows:
+        sorted_indices_by_group.setdefault(g, []).append((i, need))
+    for g in sorted_indices_by_group:
+        sorted_indices_by_group[g].sort(key=lambda x: (-x[1], x[0]))
+
+    # Three model passes. Each pass may add; no FLM cap besides DC availability and demand protection.
+    for pass_num, pass_multiplier in enumerate(cfg.pass_multipliers, start=1):
+        for g, pairs in sorted_indices_by_group.items():
+            for i, _need in pairs:
+                if group_left.get(g, 0) <= 0:
+                    continue
+
+                status = status_list[i]
+                if status == "IGNORE":
+                    continue
+
+                row_flm = max(1.0, float(flm.iloc[i]))
+                current_pred = float(pred[i])
+                current_supply = max(0.0, float(qoh.iloc[i] + supply.iloc[i]) + current_pred)
+
+                # Demand-protective ceiling.
+                d60_i = float(d60.iloc[i])
+                ttm_i = float(ttm.iloc[i])
+                d30_i = float(d30.iloc[i])
+                l30_i = float(l30.iloc[i])
+                demand_ceiling_parts = []
+                if d60_i > 0:
+                    demand_ceiling_parts.append(d60_i + cfg.overstock_buffer_flm * row_flm)
+                if ttm_i > 0:
+                    demand_ceiling_parts.append(ttm_i / 3.0 + cfg.overstock_buffer_flm * row_flm)
+                if d30_i > 0:
+                    demand_ceiling_parts.append(d30_i * 1.25 + cfg.overstock_buffer_flm * row_flm)
+                if l30_i > 0:
+                    demand_ceiling_parts.append(l30_i * 1.75 + cfg.overstock_buffer_flm * row_flm)
+
+                if demand_ceiling_parts:
+                    ceiling = max(demand_ceiling_parts)
+                else:
+                    ceiling = current_supply + row_flm
+
+                target_need = raw_need[i] * pass_multiplier
+                desired_final_supply = max(current_supply, float(qoh.iloc[i] + supply.iloc[i]) + target_need)
+                desired_final_supply = min(desired_final_supply, ceiling)
+                add_need = max(0.0, desired_final_supply - current_supply)
+
+                # Avoid weak Z-No-Alloc additions unless they have real demand.
+                if status == "Z_NO_ALLOC" and raw_need[i] < row_flm * 0.40:
+                    add_need = 0.0
+
+                allocation = mround_to_flm(add_need, row_flm, group_left[g])
+                if allocation <= 0:
+                    continue
+
+                pred[i] += allocation
+                pass_allocs[pass_num][i] += allocation
+                group_left[g] -= allocation
+
+                if reasons[i]:
+                    reasons[i] += "; "
+                reasons[i] += f"Pass {pass_num}: +{allocation}"
+
+    # Blank preservation:
+    # - rows outside Allocate/Review/Z-No-Alloc remain blank
+    # - zero predictions remain blank by default
+    pred_series = pd.Series(pred, index=out.index)
+    predicted_display = pred_series.astype(object)
+    predicted_display[pred_series <= 0] = ""
+
+    audit = pd.DataFrame({
+        "Row": np.arange(2, n + 2),
+        "Status": status_list,
+        "Raw Need Score": np.round(raw_need, 3),
+        "Predicted Final Alloc": predicted_display,
+        "Pass 1 Add": pass_allocs[1],
+        "Pass 2 Add": pass_allocs[2],
+        "Pass 3 Add": pass_allocs[3],
+        "Reason": reasons,
+    })
+
+    # Add useful source fields to audit when present.
+    for label, key in [
+        ("Flag", "flag"),
+        ("Item/Group", "group_key"),
+        ("FLM", "flm"),
+        ("Left DC", "left_dc"),
+        ("Proj. Demand", "proj_demand"),
+        ("Alloc. Rec.", "alloc_rec"),
+        ("D60", "d60"),
+        ("TTM", "ttm"),
+        ("QOH", "qoh"),
+        ("Supply", "supply"),
+    ]:
+        col = cmap.get(key)
+        if col and col in out.columns:
+            audit[label] = out[col].values
+
+    # Update Final Alloc column or create one if missing.
+    if final_col and final_col in out.columns:
+        out[final_col] = predicted_display
+    else:
+        out["Final Alloc."] = predicted_display
+
+    # Update/derive Final Supply where present: AP + AQ + predicted allocation.
+    if final_supply_col and final_supply_col in out.columns:
+        out[final_supply_col] = (qoh + supply + pred_series).round(0).astype(int)
+
+    return out, audit
+
+
+def dataframe_to_xlsx_bytes(result_df: pd.DataFrame, audit_df: pd.DataFrame, summary: Dict) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        result_df.to_excel(writer, index=False, sheet_name="Allocation Output")
+        audit_df.to_excel(writer, index=False, sheet_name="Allocation Audit")
+        pd.DataFrame([summary]).to_excel(writer, index=False, sheet_name="Run Summary")
+
+        wb = writer.book
+        for ws in wb.worksheets:
+            header_fill = PatternFill("solid", fgColor="1F4E78")
+            header_font = Font(color="FFFFFF", bold=True)
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+            ws.freeze_panes = "A2"
+            for col_cells in ws.columns:
+                col_letter = col_cells[0].column_letter
+                values = [str(c.value) if c.value is not None else "" for c in col_cells[:200]]
+                width = min(max(10, int(np.percentile([len(v) for v in values], 90)) + 2), 45)
+                ws.column_dimensions[col_letter].width = width
+    output.seek(0)
+    return output.getvalue()
+
+
+def dataframe_to_csv_bytes(result_df: pd.DataFrame) -> bytes:
+    return result_df.to_csv(index=False).encode("utf-8")
+
+
+def profile_dataframe(df: pd.DataFrame, cmap: Dict[str, Optional[str]]) -> Dict:
+    final_col = cmap.get("final_alloc")
+    flag_col = cmap.get("flag")
+    left_col = cmap.get("left_dc")
+    out = {
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "detected_final_alloc_col": final_col or "created Final Alloc.",
+        "detected_flag_col": flag_col or "not detected",
+        "detected_left_dc_col": left_col or "not detected",
     }
+    if flag_col:
+        flags = safe_str_series(df[flag_col]).str.upper()
+        out["allocate_rows"] = int(flags.str.contains("ALLOC", na=False).sum())
+        out["review_rows"] = int(flags.str.contains("REVIEW", na=False).sum())
+        out["z_no_alloc_rows"] = int((flags.str.contains("NO", na=False) & flags.str.contains("ALLOC", na=False)).sum())
+    return out
 
 
-def _read_csv(path: Path) -> pd.DataFrame:
-    try:
-        if path.exists():
-            return pd.read_csv(path)
-    except Exception:
-        pass
-    return pd.DataFrame()
+# ============================================================
+# UI
+# ============================================================
 
-
-def _feature_family_summary(fi: pd.DataFrame) -> pd.DataFrame:
-    if fi.empty:
-        return pd.DataFrame()
-    return fi.groupby(["model", "feature_family"], as_index=False)["importance"].sum().sort_values("importance", ascending=False)
-
-
-def _safe_model_feature_importance(models: dict) -> pd.DataFrame:
-    rows = []
-    for label in ["Base Allocation", "Base Review"]:
-        try:
-            rows.append(model_feature_importance(models[label], label, top_n=120))
-        except Exception:
-            pass
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
-
-metadata, summary_meta = load_metadata()
+st.title("📦 Allocation AI — Base Model v1/v2")
+st.caption(APP_VERSION)
 
 with st.sidebar:
-    st.header("Model system")
-    st.success("Built-in: Base Allocation + Base Review")
-    st.caption("Allocate rows and Review rows are handled by separate packaged MLP models. No Alloc / Z rows are ignored and left blank.")
+    st.header("Model Selection")
+    model_name = st.selectbox("Choose model", list(MODEL_CONFIGS.keys()), index=1)
+    cfg = MODEL_CONFIGS[model_name]
+    st.info(cfg.description)
 
-    st.header("Prediction controls")
-    use_model_thresholds = st.checkbox("Use trained model thresholds", value=True)
-    alloc_default = float(_metric_dict(metadata.get("Base Allocation", {})).get("best_threshold") or 0.90)
-    review_default = float(_metric_dict(metadata.get("Base Review", {})).get("best_threshold") or 0.05)
-    allocation_threshold = st.slider("Base Allocation threshold", 0.01, 0.99, min(max(alloc_default, 0.01), 0.99), 0.01, disabled=use_model_thresholds)
-    review_threshold = st.slider("Base Review threshold", 0.01, 0.99, min(max(review_default, 0.01), 0.99), 0.01, disabled=use_model_thresholds)
+    st.header("Output Options")
+    output_format = st.radio("Download format", ["XLSX with audit", "CSV only"], index=0)
+    show_preview_rows = st.slider("Preview rows", 10, 200, 50, step=10)
 
-    demand_extra = st.slider("Demand cap extra FLM", 0.0, 8.0, 1.0, 0.25)
-    alloc_rec_influence = st.selectbox("Alloc. Rec. influence", ["feature_only", "soft_cap", "balanced", "hard_cap"], index=2)
-    prefer_left_dc = st.checkbox("Prefer Left DC over DC Avail", value=True)
-    allow_partial = st.checkbox("Allow below-FLM leftover allocation", value=True)
-
-    st.header("Review ranking")
-    review_priority_weight = st.slider("Priority model weight", 0.0, 1.0, 0.50, 0.05)
-    review_probability_weight = st.slider("Probability weight", 0.0, 1.0, 0.25, 0.05)
-    review_need_weight = st.slider("Need weight", 0.0, 1.0, 0.25, 0.05)
-    partial_single = st.checkbox("Give below-FLM Review leftover to one top row", value=True)
-    partial_min_priority = st.slider("Minimum Review priority for below-FLM leftover", 0.0, 1.0, 0.50, 0.05)
-
-    st.header("Performance")
-    chunk_size = st.select_slider("Prediction chunk size", options=[500, 1000, 2500, 5000, 10000], value=2500)
-
-    st.header("Advanced v7 controls")
-    use_dc_optimizer = st.checkbox("Use DC allocation optimizer", value=True)
-    use_quantity_correction = st.checkbox("Use quantity correction model", value=True)
-    use_override_detector = st.checkbox("Use override detector", value=True)
-
-    with st.expander("What do these settings mean?", expanded=True):
-        st.markdown(
-            """
-            **Use trained model thresholds**: Uses the validation-tested threshold saved with each model. Turn this off only when you want to manually make the AI more or less aggressive.
-
-            **Base Allocation threshold**: Minimum confidence needed for rows flagged `Allocate`. Higher values produce fewer allocations; lower values produce more.
-
-            **Base Review threshold**: Minimum confidence needed for rows flagged `Review`. Review rows are also ranked by priority before consuming DC.
-
-            **Demand cap extra FLM**: Safety buffer above demand. A value of `1.0` means the simulator can allow roughly one extra FLM beyond the demand cap when justified.
-
-            **Alloc. Rec. influence**: Controls how much the workbook's `Alloc. Rec.` column constrains final output. `feature_only` only lets the model learn from it; `hard_cap` makes it a strict cap.
-
-            **Prefer Left DC over DC Avail**: Uses the workbook's `Left DC` as the starting inventory pool when available. This is usually best because it reflects the allocation worksheet.
-
-            **Allow below-FLM leftover allocation**: If remaining DC is positive but less than one FLM, the app can allocate that exact leftover amount instead of rounding to blank.
-
-            **Review ranking weights**: Blend the Review model's priority score, probability score, and need score. Higher priority weight means the Review ranking model controls more of the ordering.
-
-            **Give below-FLM Review leftover to one top row**: Assigns the final below-FLM leftover to one highest-priority Review row rather than splitting it.
-
-            **Minimum Review priority for below-FLM leftover**: Minimum blended Review score required before the leftover is assigned.
-
-            **Prediction chunk size**: Controls how many rows are scored at once. Smaller values use less memory; larger values can be faster.
-
-            **Use DC allocation optimizer**: Processes each section by model priority instead of simple row order, so scarce DC is consumed by the strongest rows first while the output still preserves original row order.
-
-            **Use quantity correction model**: Applies the v7 second-stage quantity model, which can adjust predicted FLM units up or down before simulation.
-
-            **Use override detector**: Uses the v7 auxiliary override signal in the audit output to show when the model believes workbook recommendation behavior may be overridden.
-            """
-        )
-
-st.title(APP_TITLE)
-st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system. This version runs with NumPy-only v7 model bundles exported from the latest trainer and does not install scikit-learn, TensorFlow, or Keras.")
-
-predict_tab, insights_tab, model_tab, process_tab = st.tabs([
-    "Predict Allocation",
-    "Prediction Insights",
-    "Model Metrics",
-    "How It Works + Feature Guide",
-])
-
-with predict_tab:
-    st.markdown("## 1. Upload allocation file")
-    uploaded = st.file_uploader("Upload `.xlsb`, `.xlsx`, or `.csv` allocation file", type=["xlsb", "xlsx", "csv"])
-    sheet_name = st.text_input("Excel sheet name", value="3.3 Working Table")
-
-    if uploaded is not None:
-        try:
-            tmp_path = save_upload(uploaded, suffix=Path(uploaded.name).suffix)
-            with st.spinner("Reading allocation file and preserving row order..."):
-                df = read_allocation_file(tmp_path, sheet_name=sheet_name)
-            st.success(f"Loaded `{uploaded.name}` with {len(df):,} rows and {len(df.columns):,} columns.")
-            with st.expander("Detected workbook column mapping", expanded=False):
-                diag = ColumnDiagnostics(rows=len(df), columns=len(df.columns), header_map=build_column_map(df))
-                st.dataframe(pd.DataFrame(diag.as_rows()), use_container_width=True, height=360)
-
-            st.markdown("## 2. Run prediction")
-            if st.button("Predict Final Alloc", type="primary"):
-                cfg = TwoPredictionConfig(
-                    allocation_threshold=None if use_model_thresholds else float(allocation_threshold),
-                    review_threshold=None if use_model_thresholds else float(review_threshold),
-                    demand_cap_extra_flm=float(demand_extra),
-                    alloc_rec_influence=str(alloc_rec_influence),
-                    prefer_left_dc=bool(prefer_left_dc),
-                    allow_partial_leftover_below_flm=bool(allow_partial),
-                    review_priority_weight=float(review_priority_weight),
-                    review_probability_weight=float(review_probability_weight),
-                    review_need_weight=float(review_need_weight),
-                    review_partial_leftover_to_single_row=bool(partial_single),
-                    review_partial_leftover_min_priority=float(partial_min_priority),
-                    prediction_chunk_size=int(chunk_size),
-                    use_dc_optimizer=bool(use_dc_optimizer),
-                    use_quantity_correction=bool(use_quantity_correction),
-                    use_override_detector=bool(use_override_detector),
-                )
-                with st.spinner("Loading models, scoring Allocate/Review sections, and simulating DC availability..."):
-                    models = cached_models()
-                    out_df, audit_df, run_summary = predict_allocation_file(df, models, cfg)
-                try:
-                    fi = _safe_model_feature_importance(models)
-                except Exception:
-                    fi = pd.DataFrame()
-                try:
-                    rel = prediction_feature_relationships(df, audit_df, top_n=80)
-                except Exception:
-                    rel = pd.DataFrame()
-
-                st.session_state["input_df"] = df
-                st.session_state["out_df"] = out_df
-                st.session_state["audit_df"] = audit_df
-                st.session_state["run_summary"] = run_summary
-                st.session_state["feature_importance"] = fi
-                st.session_state["feature_relationships"] = rel
-                st.success("Prediction complete. Final Alloc values are integer quantities or blank.")
-        except Exception as exc:
-            st.error("File loading or prediction setup failed.")
-            st.exception(exc)
-
-    if "out_df" in st.session_state:
-        out_df = st.session_state["out_df"]
-        audit_df = st.session_state["audit_df"]
-        run_summary = st.session_state["run_summary"]
-
-        st.markdown("## 3. Summary")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Rows", f"{run_summary.get('rows', 0):,}")
-        c2.metric("Allocated rows", f"{run_summary.get('allocated_rows', 0):,}")
-        c3.metric("Total Final Alloc", f"{run_summary.get('total_final_alloc', 0):,}")
-        c4.metric("Ignored non-Alloc/Review", f"{run_summary.get('ignored_no_alloc_rows', 0):,}")
-        c5.metric("Review partial leftover units", f"{run_summary.get('review_partial_leftover_units', 0):,}")
-
-        st.info(
-            f"Thresholds used — Base Allocation: `{run_summary.get('allocation_threshold')}` · "
-            f"Base Review: `{run_summary.get('review_threshold')}`"
-        )
-
-        section_rows = pd.DataFrame([{"section": k, "rows": v} for k, v in run_summary.get("section_rows", {}).items()])
-        if not section_rows.empty:
-            st.markdown("### Section rows")
-            st.bar_chart(section_rows.set_index("section"))
-
-        left, right = st.columns(2)
-        with left:
-            st.subheader("Completed allocation preview")
-            st.dataframe(out_df.head(250), use_container_width=True, height=420)
-        with right:
-            st.subheader("Audit preview")
-            st.dataframe(audit_df.head(250), use_container_width=True, height=420)
-
-        completed_csv = dataframe_to_csv_bytes(out_df)
-        audit_csv = dataframe_to_csv_bytes(audit_df)
-        summary_bytes = json.dumps(run_summary, indent=2, default=str).encode("utf-8")
-        feature_imp_csv = dataframe_to_csv_bytes(st.session_state.get("feature_importance", pd.DataFrame()))
-        rel_csv = dataframe_to_csv_bytes(st.session_state.get("feature_relationships", pd.DataFrame()))
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("completed_allocation.csv", completed_csv)
-            z.writestr("allocation_audit.csv", audit_csv)
-            z.writestr("prediction_summary.json", summary_bytes)
-            z.writestr("model_feature_importance.csv", feature_imp_csv)
-            z.writestr("prediction_feature_relationships.csv", rel_csv)
-        zip_bytes = zip_buffer.getvalue()
-
-        st.markdown("## 4. Downloads")
-        d1, d2, d3 = st.columns(3)
-        d1.download_button("Download completed CSV", completed_csv, "completed_allocation.csv", "text/csv")
-        d2.download_button("Download audit CSV", audit_csv, "allocation_audit.csv", "text/csv")
-        d3.download_button("Download output ZIP", zip_bytes, "allocation_ai_two_model_output.zip", "application/zip")
-    else:
-        st.info("Upload a file and run prediction to generate completed allocation outputs.")
-
-with insights_tab:
-    st.markdown("## Prediction Insights")
-    if "audit_df" not in st.session_state:
-        st.info("Run a prediction first to populate this page.")
-    else:
-        audit = st.session_state["audit_df"].copy()
-        fi = st.session_state.get("feature_importance", pd.DataFrame()).copy()
-        rel = st.session_state.get("feature_relationships", pd.DataFrame()).copy()
-        audit["final_alloc_numeric"] = pd.to_numeric(audit.get("final_alloc", 0), errors="coerce").fillna(0)
-        audit["allocated"] = audit["final_alloc_numeric"] > 0
-
-        st.markdown("### Allocation by model section")
-        section_mix = audit.groupby("model_used", dropna=False).agg(
-            rows=("model_used", "size"),
-            allocated_rows=("allocated", "sum"),
-            total_alloc=("final_alloc_numeric", "sum"),
-            avg_probability=("probability", "mean"),
-            avg_priority=("priority", "mean"),
-        ).reset_index().sort_values("total_alloc", ascending=False)
-        st.dataframe(section_mix, use_container_width=True, height=240)
-        if not section_mix.empty:
-            st.bar_chart(section_mix.set_index("model_used")[["rows", "allocated_rows"]])
-            st.bar_chart(section_mix.set_index("model_used")["total_alloc"])
-
-        st.markdown("### Top allocated items")
-        item_mix = audit.groupby("item", dropna=False).agg(
-            rows=("item", "size"),
-            allocated_rows=("allocated", "sum"),
-            total_alloc=("final_alloc_numeric", "sum"),
-            avg_section_score=("section_score", "mean"),
-            avg_probability=("probability", "mean"),
-        ).reset_index().sort_values("total_alloc", ascending=False).head(30)
-        st.dataframe(item_mix, use_container_width=True, height=350)
-        if not item_mix.empty:
-            st.bar_chart(item_mix.set_index("item")["total_alloc"])
-
-        st.markdown("### Decision reasons")
-        reasons = audit.get("reason", pd.Series("", index=audit.index)).astype(str).str.split("; ").explode().replace("", np.nan).dropna().value_counts().head(25).rename_axis("reason").reset_index(name="rows")
-        st.dataframe(reasons, use_container_width=True, height=300)
-        if not reasons.empty:
-            st.bar_chart(reasons.set_index("reason")["rows"])
-
-        st.markdown("### Model feature usage")
-        st.caption("Approximate feature usage from neural-network first-layer weight magnitudes. This is an inspection view, not causal proof.")
-        if fi.empty:
-            st.info("No feature importance information was available.")
-        else:
-            family = _feature_family_summary(fi)
-            st.subheader("Feature family usage")
-            st.dataframe(family, use_container_width=True, height=330)
-            if not family.empty:
-                pivot = family.pivot_table(index="feature_family", columns="model", values="importance", aggfunc="sum", fill_value=0)
-                st.bar_chart(pivot)
-            st.subheader("Top base features")
-            st.dataframe(fi.head(60), use_container_width=True, height=420)
-
-        st.markdown("### Run-specific feature relationships")
-        st.caption("Correlations between engineered numeric features and this run's predicted probability / final allocation.")
-        if rel.empty:
-            st.info("No run-specific feature relationship table was available.")
-        else:
-            st.dataframe(rel.head(60), use_container_width=True, height=420)
-            st.bar_chart(rel.head(25).set_index("feature")["relationship_strength"])
-
-with model_tab:
-    st.markdown("## Model Metrics")
-    st.caption("The app uses two separately trained MLP model bundles: one for Allocate rows and one for Review rows.")
-
-    summary_rows = []
-    for label in ["Base Allocation", "Base Review"]:
-        meta = metadata.get(label, {})
-        m = _metric_dict(meta)
-        summary_rows.append({"Model": label, **m})
-    model_summary = pd.DataFrame(summary_rows)
-    st.dataframe(model_summary, use_container_width=True, hide_index=True)
-
-    for label in ["Base Allocation", "Base Review"]:
-        meta = metadata.get(label, {})
-        m = _metric_dict(meta)
-        st.divider()
-        st.markdown(f"### {label}")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Rows trained/valid", f"{int(m.get('rows_train') or 0):,} / {int(m.get('rows_validation') or 0):,}")
-        c2.metric("Best epoch", f"{int(m.get('best_epoch') or 0):,}")
-        c3.metric("Threshold", _fmt(m.get("best_threshold"), 2))
-        c4.metric("Model size MB", _fmt(m.get("model_file_mb"), 2))
-
-        x1, x2, x3, x4 = st.columns(4)
-        x1.metric("Positive rows", f"{int(m.get('positive_rows_total') or 0):,}")
-        x2.metric("Negative rows", f"{int(m.get('negative_rows_total') or 0):,}")
-        x3.metric("Quantity correction", "On" if m.get("quantity_correction_enabled") else "Off")
-        x4.metric("Override detector", "On" if m.get("override_detector_enabled") else "Off")
-
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("F1", _fmt(m.get("f1")))
-        p2.metric("Precision", _fmt(m.get("precision")))
-        p3.metric("Recall", _fmt(m.get("recall")))
-        p4.metric("Unit accuracy", _fmt(m.get("unit_accuracy")))
-        p5.metric("Unit MAE", _fmt(m.get("unit_mae"), 4))
-
-        backtest = read_json(BACKTEST_FILES.get(label, Path("")))
-        if backtest:
-            st.markdown("#### Workbook-like backtest")
-            b1, b2, b3, b4, b5 = st.columns(5)
-            b1.metric("Exact match", _fmt(backtest.get("row_exact_match")))
-            b2.metric("Near match", _fmt(backtest.get("row_near_match")))
-            b3.metric("Unit MAE", _fmt(backtest.get("unit_mae"), 4))
-            b4.metric("Predicted units", f"{int(backtest.get('predicted_total_units') or 0):,}")
-            b5.metric("Actual units", f"{int(backtest.get('actual_total_units') or 0):,}")
-            with st.expander("Backtest JSON", expanded=False):
-                st.json(backtest)
-
-        sweep = _read_csv(SWEEP_FILES[label])
-        if not sweep.empty:
-            st.markdown("#### Threshold sweep")
-            st.dataframe(sweep, use_container_width=True, height=260)
-            cols = [c for c in ["f1", "precision", "recall"] if c in sweep.columns]
-            if "threshold" in sweep.columns and cols:
-                st.line_chart(sweep.set_index("threshold")[cols])
-
-        progress = _read_csv(PROGRESS_FILES[label])
-        if not progress.empty:
-            st.markdown("#### Training progress")
-            st.dataframe(progress.tail(25), use_container_width=True, height=300)
-            cols = [c for c in ["val_f1", "val_precision", "val_recall", "val_unit_mae"] if c in progress.columns]
-            if "epoch" in progress.columns and cols:
-                st.line_chart(progress.set_index("epoch")[cols])
-
-        val = _read_csv(VALIDATION_FILES[label])
-        if not val.empty:
-            st.markdown("#### Validation prediction sample")
-            st.dataframe(val.head(100), use_container_width=True, height=260)
-
-        with st.expander(f"Full {label} metadata", expanded=False):
-            st.json(meta)
-
-    if summary_meta:
-        st.divider()
-        st.markdown("### Full two-model system summary")
-        st.json({k: v for k, v in summary_meta.items() if k != "models"})
-
-with process_tab:
-    st.markdown("## How the two-model system works")
+    st.header("Model Notes")
     st.markdown(
         """
-        This Streamlit app is a prediction-only interface for a section-aware allocation model.
+        **Base Model v1**
+        - More conservative
+        - Better when over-allocation risk matters most
+        - Closer to the Version 6 baseline
 
-        **End-to-end flow**
-
-        1. Upload an allocation workbook as `.xlsb`, `.xlsx`, or `.csv`.
-        2. The app detects key workbook columns, including item, site, demand, supply, Final Alloc, Left DC, Alloc. Rec., FLM, flag, Demand Check, and Helper.
-        3. Rows marked **Allocate** are scored by the **Base Allocation** model.
-        4. Rows marked **Review** are scored by the **Base Review** model.
-        5. Rows that are not Allocate or Review are ignored and left blank.
-        6. The app simulates remaining DC by item while filling Final Alloc.
-        7. Review rows are ranked by a blend of model priority, model probability, and need so the most important review rows consume scarce DC first.
-        8. The v7 system can apply a quantity-correction model, override detector, and DC allocation optimizer before writing Final Alloc.
-        9. The output is a completed CSV plus an audit CSV and explanation tables.
+        **Base Model v2**
+        - More complete demand blend
+        - Stronger use of BM/BN
+        - More willing to allocate Z - No Alloc opportunity rows
+        - Closer to the Version 8 improvement
         """
     )
 
-    st.markdown("### Core model features")
-    feature_groups = pd.DataFrame([
-        {"Feature group": "Demand / velocity", "Examples": "L30, D30, D60, LW, TTM, projected demand, recent velocity blend, demand acceleration, demand consistency, spike/decline flags"},
-        {"Feature group": "Supply / DC", "Examples": "QOH, supply, DC available, Left DC, reconstructed DC before Final Alloc"},
-        {"Feature group": "Allocation recommendation", "Examples": "Alloc. Rec., Alloc. Rec. units, Alloc. Rec. to need/DC/projection ratios"},
-        {"Feature group": "Need / scarcity", "Examples": "Need gap, demand cap, need-to-DC pressure, DC-to-need ratio"},
-        {"Feature group": "Section/group context", "Examples": "Item totals, site totals, department/class totals, item-section totals"},
-        {"Feature group": "Ranking", "Examples": "Within-item rank by need, demand, Alloc. Rec., DC-before, and velocity"},
-        {"Feature group": "Workbook helper logic", "Examples": "Demand Check, Helper, Final Supply, FLM, partial leftover indicators, quantity correction, override detector signals"},
-        {"Feature group": "Categorical identity", "Examples": "Item, UPC, site, description, department, class, region, flag"},
-    ])
-    st.dataframe(feature_groups, use_container_width=True, hide_index=True)
+st.markdown(
+    """
+Upload an allocation file and the app will fill **Final Alloc.** using the selected base model.
 
-    st.markdown("### What makes this section-aware")
-    st.markdown(
-        """
-        The model is not only looking row by row. The training process rebuilt each row in context:
+**Supported inputs:** `.csv`, `.xlsx`, `.xlsm`, `.xlsb`  
+**Main behavior:** fills Final Alloc only, keeps non-candidate rows blank, uses three allocation passes, rounds to FLM, and allows remaining DC units below one FLM.
+"""
+)
 
-        - How much demand exists for the item across all stores.
-        - How much need exists within the current section.
-        - How scarce DC is for the item.
-        - Where the row ranks among competing rows for the same item.
-        - How much DC likely existed **before** historical Final Alloc values were entered.
+uploaded = st.file_uploader("Upload allocation file", type=["csv", "xlsx", "xlsm", "xlsb"])
 
-        That section context is especially important for Review rows, where the model should prioritize rows that need product most.
-        """
+if uploaded is None:
+    st.warning("Upload a file to run the allocation model.")
+    st.stop()
+
+sheet_names = []
+try:
+    sheet_names = get_sheet_names(uploaded)
+except Exception:
+    sheet_names = []
+
+selected_sheet = None
+if sheet_names:
+    selected_sheet = st.selectbox("Sheet", sheet_names, index=0)
+
+try:
+    df, meta = read_uploaded_file(uploaded, selected_sheet)
+except Exception as e:
+    st.error(f"Could not read the uploaded file: {e}")
+    st.stop()
+
+# Drop fully blank rows but preserve column order.
+df = df.dropna(how="all").reset_index(drop=True)
+
+cmap = build_column_map(df)
+profile = profile_dataframe(df, cmap)
+
+st.subheader("Detected File Structure")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Rows", f"{profile['rows']:,}")
+col2.metric("Columns", f"{profile['columns']:,}")
+col3.metric("Flag Column", profile["detected_flag_col"])
+col4.metric("Final Alloc Column", profile["detected_final_alloc_col"])
+
+with st.expander("Detected column map", expanded=False):
+    st.json({k: (v if v is not None else "not detected") for k, v in cmap.items()})
+
+missing_critical = []
+for key in ["flag", "left_dc", "flm"]:
+    if not cmap.get(key):
+        missing_critical.append(key)
+
+if missing_critical:
+    st.warning(
+        "Some expected columns were not detected: "
+        + ", ".join(missing_critical)
+        + ". The app will use safe fallbacks where possible, but results may be less accurate."
     )
 
-    st.markdown("### Model roles")
-    roles = pd.DataFrame([
-        {"Model": "Base Allocation", "Rows handled": "Allocate", "Main purpose": "Fill normal allocation rows with integer Final Alloc quantities."},
-        {"Model": "Base Review", "Rows handled": "Review", "Main purpose": "Rank and allocate Review rows, especially when DC is scarce."},
-        {"Model": "Ignored", "Rows handled": "No Alloc / Z / other", "Main purpose": "Left blank by design in this version."},
-    ])
-    st.dataframe(roles, use_container_width=True, hide_index=True)
+run = st.button("Run Allocation Model", type="primary")
+
+if not run:
+    st.stop()
+
+with st.spinner("Running allocation model..."):
+    result_df, audit_df = compute_model_predictions(df, cmap, cfg)
+
+allocated_count = int((pd.to_numeric(audit_df["Predicted Final Alloc"], errors="coerce").fillna(0) > 0).sum())
+total_units = int(pd.to_numeric(audit_df["Predicted Final Alloc"], errors="coerce").fillna(0).sum())
+pass1 = int(audit_df["Pass 1 Add"].sum())
+pass2 = int(audit_df["Pass 2 Add"].sum())
+pass3 = int(audit_df["Pass 3 Add"].sum())
+
+summary = {
+    "app_version": APP_VERSION,
+    "model": model_name,
+    "run_timestamp": datetime.now().isoformat(timespec="seconds"),
+    "input_file": uploaded.name,
+    "sheet": selected_sheet or "",
+    "rows": len(df),
+    "allocated_rows": allocated_count,
+    "total_units_allocated": total_units,
+    "pass_1_units": pass1,
+    "pass_2_units": pass2,
+    "pass_3_units": pass3,
+}
+
+st.success("Allocation complete.")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Allocated Rows", f"{allocated_count:,}")
+m2.metric("Total Units", f"{total_units:,}")
+m3.metric("Pass 1 / 2 / 3", f"{pass1:,} / {pass2:,} / {pass3:,}")
+m4.metric("Model", model_name)
+
+st.subheader("Allocation Audit Preview")
+preview_cols = [
+    c for c in [
+        "Row", "Status", "Flag", "Item/Group", "FLM", "Left DC", "Proj. Demand",
+        "Alloc. Rec.", "D60", "TTM", "QOH", "Supply", "Predicted Final Alloc",
+        "Pass 1 Add", "Pass 2 Add", "Pass 3 Add", "Reason"
+    ] if c in audit_df.columns
+]
+st.dataframe(audit_df[preview_cols].head(show_preview_rows), use_container_width=True)
+
+st.subheader("Output Preview")
+st.dataframe(result_df.head(show_preview_rows), use_container_width=True)
+
+safe_model_name = model_name.lower().replace(" ", "_")
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+if output_format == "XLSX with audit":
+    out_bytes = dataframe_to_xlsx_bytes(result_df, audit_df, summary)
+    st.download_button(
+        "Download completed allocation workbook",
+        data=out_bytes,
+        file_name=f"allocation_output_{safe_model_name}_{stamp}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+else:
+    out_bytes = dataframe_to_csv_bytes(result_df)
+    st.download_button(
+        "Download completed allocation CSV",
+        data=out_bytes,
+        file_name=f"allocation_output_{safe_model_name}_{stamp}.csv",
+        mime="text/csv",
+    )
+
+with st.expander("Run summary", expanded=False):
+    st.json(summary)
