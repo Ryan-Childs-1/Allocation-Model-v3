@@ -1,62 +1,26 @@
-# Allocation AI — Base Model v1/v2 Streamlit App
+# Allocation AI Two-Model Streamlit App
 
-Completed Streamlit app for selecting and running **Base Model v1** or **Base Model v2** on Sportsman's Warehouse allocation files.
+This Streamlit app runs the latest Base Allocation and Base Review NumPy-only models exported from the Keras trainer with negative-row mixing and expanded demand features.
 
-## What this app does
+## Runtime dependencies
 
-- Upload `.csv`, `.xlsx`, `.xlsm`, or `.xlsb`
-- Select **Base Model v1** or **Base Model v2**
-- Fill **Final Alloc.** only
-- Preserve blank allocations for non-candidate rows
-- Include `Allocate`, `Review`, and `Z - No Alloc` rows as model candidates
-- Run three allocation passes
-- Round to FLM/pack size
-- Allow allocation of remaining DC units when `Left DC < FLM`
-- Download output as XLSX with audit tabs or CSV
+The app intentionally does **not** require scikit-learn, TensorFlow, Keras, or SciPy.
 
-## Files
+## Included models
 
-- `app.py` — Streamlit app
-- `requirements.txt` — Python dependencies
-- `.streamlit/config.toml` — Streamlit Cloud configuration
+- `base_allocation_numpy_model.joblib` — Base Allocation model for rows flagged Allocate.
+- `base_review_numpy_model.joblib` — Base Review model for rows flagged Review.
 
-## Run locally
+Both models are NumPy-only bundles and can run on Streamlit Cloud without ML framework installs.
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+## Outputs
 
-## Streamlit Cloud
+- completed allocation CSV
+- allocation audit CSV
+- prediction summary JSON
+- feature importance CSV
+- feature relationship CSV
 
-Upload this flat project folder to GitHub, then deploy `app.py`.
+## Notes
 
-## Model definitions
-
-### Base Model v1
-Conservative baseline. Better when the priority is avoiding over-allocation.
-
-### Base Model v2
-Improved baseline. Uses a fuller demand blend and stronger BM/BN signals, while still protecting against demand-overstock issues.
-
-## Expected column logic
-
-The app detects columns by name and by fallback Excel positions:
-
-- `BR` = Flag
-- `BS` = Final Alloc.
-- `BN` = Alloc. Rec.
-- `BM` = Proj. Demand
-- `BT` = Left DC
-- `BU` = Final Supply
-- `BK` = FLM
-- `AP` = QOH
-- `AQ` = Supply
-- `AK/AL/AM/AN/AO` = L30/D30/D60/LW/TTM
-- `CA` = Demand Discount
-- `CB` = New Base Demand
-- `O` = group/item key fallback
-
-## Important note
-
-This app is self-contained and does not require TensorFlow, Keras, PyTorch, or external model artifacts. That avoids Streamlit Cloud Python-version dependency failures while preserving the Base Model v1/v2 selection workflow.
+The app includes the newer demand-focused feature engineering around L30, D30, D60, LW, TTM, projected demand, demand acceleration, demand consistency, and demand-to-supply coverage.

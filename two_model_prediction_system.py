@@ -33,9 +33,6 @@ class TwoPredictionConfig:
     review_partial_leftover_to_single_row: bool = True
     review_partial_leftover_min_priority: float = 0.50
     prediction_chunk_size: int = 2500
-    use_dc_optimizer: bool = True
-    use_quantity_correction: bool = True
-    use_override_detector: bool = True
 
 
 # -----------------------------------------------------------------------------
@@ -410,23 +407,15 @@ def _keras_layers_raw(X: np.ndarray, model: dict) -> np.ndarray:
             h = np.maximum(h, 0)
     return h
 
-def _predict_model(df: pd.DataFrame, bundle: dict, chunk_size: int = 2500, use_quantity_correction: bool = True, use_override_detector: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Predict units/probability/priority with optional v7 auxiliary heads.
-
-    The v7 trainer may export two extra NumPy heads:
-      - quantity_correction_model: predicts a -3..+3 FLM adjustment
-      - override_model: estimates when the workbook Alloc. Rec. is likely overridden
-
-    Older NumPy bundles do not have those heads, so this remains backward-compatible.
-    """
+def _predict_model(df: pd.DataFrame, bundle: dict, chunk_size: int = 2500) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if len(df) == 0:
-        return np.zeros(0, dtype=int), np.zeros(0, dtype=float), np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+        return np.zeros(0, dtype=int), np.zeros(0, dtype=float), np.zeros(0, dtype=float)
     X_all = build_feature_frame(df)
     cols = list(bundle["feature_columns"])
     for c in cols:
         if c not in X_all.columns:
             X_all[c] = 0.0 if c.startswith("num__") else ""
-    all_units, all_prob, all_priority, all_override = [], [], [], []
+    all_units, all_prob, all_priority = [], [], []
     chunk_size = max(250, int(chunk_size or 2500))
     for start in range(0, len(X_all), chunk_size):
         end = min(len(X_all), start + chunk_size)
@@ -435,30 +424,9 @@ def _predict_model(df: pd.DataFrame, bundle: dict, chunk_size: int = 2500, use_q
         units = np.asarray(_mlp_predict(bundle["unit_model"], Xt), dtype=int)
         prob = np.asarray(_mlp_predict_proba_positive(bundle["prob_model"], Xt), dtype=float)
         priority = np.asarray(_mlp_predict(bundle["priority_model"], Xt), dtype=float).clip(0, 1)
-        override_prob = np.zeros(len(X), dtype=float)
+        all_units.append(units); all_prob.append(prob); all_priority.append(priority)
+    return np.concatenate(all_units), np.concatenate(all_prob), np.concatenate(all_priority)
 
-        # Optional v7 quantity correction model. It is a 7-class model where
-        # class 0..6 maps to delta -3..+3 FLM units.
-        q_model = bundle.get("quantity_correction_model")
-        if use_quantity_correction and isinstance(q_model, dict):
-            try:
-                q_raw = _mlp_predict(q_model, Xt)
-                # _mlp_predict returns class index for Keras output_type='class'.
-                delta = np.asarray(q_raw, dtype=int) - 3
-                units = np.clip(units + delta, 0, 9999).astype(int)
-            except Exception:
-                pass
-
-        # Optional v7 override detector model.
-        o_model = bundle.get("override_model")
-        if use_override_detector and isinstance(o_model, dict):
-            try:
-                override_prob = np.asarray(_mlp_predict_proba_positive(o_model, Xt), dtype=float)
-            except Exception:
-                override_prob = np.zeros(len(X), dtype=float)
-
-        all_units.append(units); all_prob.append(prob); all_priority.append(priority); all_override.append(override_prob)
-    return np.concatenate(all_units), np.concatenate(all_prob), np.concatenate(all_priority), np.concatenate(all_override)
 
 def _threshold(bundle: dict, fallback: float = 0.35) -> float:
     try:
@@ -528,14 +496,8 @@ def predict_allocation_file(df: pd.DataFrame, models: Dict[str, dict], cfg: TwoP
     for label, mask in [("Base Allocation", is_alloc), ("Base Review", is_review)]:
         idxs = raw.index[mask]
         if len(idxs):
-            units, prob, priority, override_prob = _predict_model(
-                raw.loc[idxs],
-                models[label],
-                cfg.prediction_chunk_size,
-                use_quantity_correction=bool(getattr(cfg, "use_quantity_correction", True)),
-                use_override_detector=bool(getattr(cfg, "use_override_detector", True)),
-            )
-            predictions[label] = pd.DataFrame({"units": units, "prob": prob, "priority": priority, "override_prob": override_prob}, index=idxs)
+            units, prob, priority = _predict_model(raw.loc[idxs], models[label], cfg.prediction_chunk_size)
+            predictions[label] = pd.DataFrame({"units": units, "prob": prob, "priority": priority}, index=idxs)
         else:
             predictions[label] = pd.DataFrame(columns=["units", "prob", "priority"])
 
@@ -549,10 +511,7 @@ def predict_allocation_file(df: pd.DataFrame, models: Dict[str, dict], cfg: TwoP
         need_units = max(0.0, float(demand_basis.loc[idx] - supply.loc[idx]) / (f + EPS))
         score = cfg.review_priority_weight * float(pred["priority"]) + cfg.review_probability_weight * float(pred["prob"]) + cfg.review_need_weight * np.tanh(need_units / 3.0)
         work.append((1, idx, score, "Base Review"))
-    if bool(getattr(cfg, "use_dc_optimizer", True)):
-        work = sorted(work, key=lambda x: (x[0], -x[2], int(raw.loc[x[1], "__row_order"]) if "__row_order" in raw.columns else 0))
-    else:
-        work = sorted(work, key=lambda x: (x[0], int(raw.loc[x[1], "__row_order"]) if "__row_order" in raw.columns else 0))
+    work = sorted(work, key=lambda x: (x[0], -x[2], int(raw.loc[x[1], "__row_order"]) if "__row_order" in raw.columns else 0))
 
     for pass_order, idx, section_score, model_label in work:
         it = item.loc[idx]
@@ -561,7 +520,6 @@ def predict_allocation_file(df: pd.DataFrame, models: Dict[str, dict], cfg: TwoP
         units = max(int(pred["units"]), 0)
         prob = float(pred["prob"])
         priority = float(pred["priority"])
-        override_probability = float(pred.get("override_prob", 0.0))
         threshold = cfg.allocation_threshold if model_label == "Base Allocation" else cfg.review_threshold
         if threshold is None:
             threshold = _threshold(models[model_label], 0.35)
@@ -612,7 +570,6 @@ def predict_allocation_file(df: pd.DataFrame, models: Dict[str, dict], cfg: TwoP
             "section_score": float(section_score),
             "probability": prob,
             "priority": priority,
-            "override_probability": override_probability,
             "predicted_units": units,
             "flm": f,
             "raw_alloc": int(raw_alloc),
@@ -674,9 +631,6 @@ def predict_allocation_file(df: pd.DataFrame, models: Dict[str, dict], cfg: TwoP
         "allocation_threshold": float(cfg.allocation_threshold if cfg.allocation_threshold is not None else _threshold(models["Base Allocation"], 0.35)),
         "review_threshold": float(cfg.review_threshold if cfg.review_threshold is not None else _threshold(models["Base Review"], 0.35)),
         "inference_backend": "numpy_only_no_sklearn",
-        "use_dc_optimizer": bool(getattr(cfg, "use_dc_optimizer", True)),
-        "use_quantity_correction": bool(getattr(cfg, "use_quantity_correction", True)),
-        "use_override_detector": bool(getattr(cfg, "use_override_detector", True)),
     }
     return out, audit, summary
 
@@ -757,7 +711,7 @@ def _transformed_names_from_bundle(bundle: dict, input_dim: int | None = None) -
 
 def model_feature_importance(bundle: dict, model_label: str, top_n: int = 80) -> pd.DataFrame:
     rows = []
-    for head_name, key in [("unit", "unit_model"), ("probability", "prob_model"), ("priority", "priority_model"), ("quantity_correction", "quantity_correction_model"), ("override_detector", "override_model")]:
+    for head_name, key in [("unit", "unit_model"), ("probability", "prob_model"), ("priority", "priority_model")]:
         model = bundle.get(key)
         if not model:
             continue
