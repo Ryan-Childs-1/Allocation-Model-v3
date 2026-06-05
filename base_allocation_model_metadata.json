@@ -6,6 +6,9 @@
   "rows_train": 6714,
   "rows_validation": 523,
   "positive_rows_total": 6656,
+  "negative_rows_total": 581,
+  "no_alloc_negative_mixing_enabled": true,
+  "no_alloc_negative_ratio": 0.55,
   "best_epoch": 2,
   "best_threshold": 0.01,
   "threshold_modes": {
@@ -17,22 +20,22 @@
   },
   "best_validation_metrics": {
     "threshold": 0.01,
-    "precision": 0.8716475095785441,
+    "precision": 0.8733205374280231,
     "recall": 1.0,
-    "f1": 0.9314227226202662,
-    "unit_accuracy": 0.5678776290630975,
-    "positive_unit_accuracy": 0.6505494505494506,
-    "unit_mae": 0.47992351816443596,
-    "false_positive_rate": 0.9852941176470589,
-    "predicted_positive_rows": 522.0,
+    "f1": 0.9323770491803279,
+    "unit_accuracy": 0.5659655831739961,
+    "positive_unit_accuracy": 0.6461538461538462,
+    "unit_mae": 0.47418738049713194,
+    "false_positive_rate": 0.9705882352941176,
+    "predicted_positive_rows": 521.0,
     "actual_positive_rows": 455.0
   },
   "priority_validation_summary": {
-    "priority_mean_positive": 0.8347830176353455,
-    "priority_mean_negative": 0.7262864112854004
+    "priority_mean_positive": 0.760967493057251,
+    "priority_mean_negative": 0.7149312496185303
   },
   "config": {
-    "artifact_short_name": "base_allocation_review_v2",
+    "artifact_short_name": "base_allocation_review_v3_negative_demand",
     "max_units": 240,
     "validation_size": 0.2,
     "random_state": 42,
@@ -94,6 +97,14 @@
     ],
     "positive_repeat_allocate": 2,
     "positive_repeat_review": 3,
+    "include_no_alloc_negatives": true,
+    "no_alloc_negative_ratio_allocate": 0.55,
+    "no_alloc_negative_ratio_review": 0.85,
+    "max_no_alloc_negatives_per_section": 50000,
+    "no_alloc_negative_source_sections": [
+      "z_no_alloc",
+      "other"
+    ],
     "review_priority_boost": 1.35,
     "unit_near_miss_tolerance": 1,
     "export_validation_predictions": true,
@@ -112,8 +123,8 @@
       0.95
     ]
   },
-  "trained_at_unix": 1780624882.662771,
+  "trained_at_unix": 1780625924.564865,
   "streamlit_runtime": "numpy_only_no_tensorflow_no_sklearn",
-  "model_file_mb": 6.181525230407715,
+  "model_file_mb": 6.38602352142334,
   "model_under_size_cap": true
 }

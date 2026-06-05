@@ -4,277 +4,285 @@ import numpy as np
 import pandas as pd
 from schema import build_column_map
 
-EPS = 1e-6
+NUMERIC_FIELDS = [
+    'department_id','class_id','line_id','site','mil','flm','dc_flm','cost','retail','gm_pct',
+    'l30','d30','d60','lw','ttm','qoh','supply','allocated','intrans','dc_qoh','dc_avail',
+    'avg_woc','days','proj_demand','alloc_rec','left_dc','final_supply','demand_check','helper'
+]
+CATEGORICAL_FIELDS = [
+    'vendor','vendor_site_id','brand','department_id','class_id','line_id','product_id','item','description',
+    'upc','site','site_name','state','region','zone','store_size','rank','flag'
+]
 
+def _num(df: pd.DataFrame, cmap: dict, field: str, default=0.0) -> pd.Series:
+    col = cmap.get(field)
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors='coerce')
+    return pd.Series(default, index=df.index, dtype='float64')
 
-def _num(df: pd.DataFrame, cmap: dict, field: str, default: float = 0.0) -> pd.Series:
-    c = cmap.get(field)
-    if c in df.columns:
-        return pd.to_numeric(df[c], errors="coerce")
-    return pd.Series(default, index=df.index, dtype="float64")
+def _txt(df: pd.DataFrame, cmap: dict, field: str, default='') -> pd.Series:
+    col = cmap.get(field)
+    if col in df.columns:
+        return df[col].astype(str).fillna(default)
+    return pd.Series(default, index=df.index, dtype='object')
 
+def safe_div(a, b, default=0.0):
+    a = pd.Series(a)
+    b = pd.Series(b)
+    out = a.astype(float) / b.replace(0, np.nan).astype(float)
+    return out.replace([np.inf, -np.inf], np.nan).fillna(default)
 
-def _txt(df: pd.DataFrame, cmap: dict, field: str) -> pd.Series:
-    c = cmap.get(field)
-    if c in df.columns:
-        return df[c].astype(str).fillna("").str.strip()
-    return pd.Series("", index=df.index, dtype="object")
-
-
-def _safe_div(a, b):
-    a = pd.Series(a) if not isinstance(a, pd.Series) else a
-    b = pd.Series(b, index=a.index) if not isinstance(b, pd.Series) else b
-    return (a.astype(float) / (b.astype(float).replace(0, np.nan))).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-
-def _flag_masks(flag: pd.Series):
-    f = flag.astype(str).str.upper().fillna("")
-    is_z = ((f.str.contains("NO") & f.str.contains("ALLOC")) | f.str.startswith("Z - NO") | f.str.startswith("Z NO"))
-    is_review = f.str.contains("REVIEW")
-    is_alloc = f.str.contains("ALLOC") & ~is_z
-    return is_alloc, is_review, is_z
-
-
-def reconstruct_dc_before(df: pd.DataFrame, cmap: dict) -> pd.DataFrame:
-    """Estimate item-level DC available before historical Final Alloc was assigned.
-
-    Workbook Left DC is often already reduced after allocations. For training we need
-    the pre-allocation state so the model can learn decisions as if it were seeing the
-    file before Final Alloc is entered. This reconstructs an item section pool and a
-    row-level before/after sequence in original row order.
-    """
-    item = _txt(df, cmap, "item").replace("", "__missing_item__")
-    dc_avail = _num(df, cmap, "dc_avail", 0).fillna(0).clip(lower=0)
-    left_dc = _num(df, cmap, "left_dc", np.nan)
-    final_alloc = _num(df, cmap, "final_alloc", 0).fillna(0).clip(lower=0)
-
-    before = pd.Series(0.0, index=df.index)
-    after = pd.Series(0.0, index=df.index)
-    start_pool = pd.Series(0.0, index=df.index)
-    section_remaining_ratio = pd.Series(0.0, index=df.index)
-
-    for it, idxs in item.groupby(item, sort=False).groups.items():
-        idxs = list(idxs)
-        if not idxs:
-            continue
-        da_max = float(dc_avail.loc[idxs].max())
-        total_alloc = float(final_alloc.loc[idxs].sum())
-        left_non_na = left_dc.loc[idxs].dropna().clip(lower=0)
-        left_plus_current_max = float((left_dc.loc[idxs].fillna(0).clip(lower=0) + final_alloc.loc[idxs]).max())
-        min_left_plus_total = float(left_non_na.min() + total_alloc) if len(left_non_na) else total_alloc
-        pool = max(da_max, left_plus_current_max, min_left_plus_total, total_alloc)
-        remaining = pool
-        for idx in idxs:
-            before.loc[idx] = max(remaining, 0.0)
-            alloc = float(final_alloc.loc[idx]) if np.isfinite(final_alloc.loc[idx]) else 0.0
-            remaining = max(0.0, remaining - alloc)
-            after.loc[idx] = remaining
-            start_pool.loc[idx] = pool
-            section_remaining_ratio.loc[idx] = remaining / (pool + EPS)
-    return pd.DataFrame({
-        "num__dc_start_pool_estimated": start_pool,
-        "num__dc_before_row": before,
-        "num__dc_after_row_historical": after,
-        "num__dc_before_left_plus_final": (left_dc.fillna(0).clip(lower=0) + final_alloc).clip(lower=0),
-        "num__section_remaining_ratio_after_hist": section_remaining_ratio,
-    }, index=df.index)
-
+def _flag_section(flag: pd.Series) -> pd.Series:
+    f = flag.astype(str).str.upper()
+    return np.select(
+        [f.str.contains('REVIEW', na=False), f.str.contains('NO.*ALLOC|Z - NO|Z NO', regex=True, na=False), f.str.contains('ALLOC', na=False)],
+        ['review','z_no_alloc','allocate'],
+        default='other'
+    )
 
 def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a dense feature frame before preprocessing.
+
+    The trainer later fits the preprocessor. The Streamlit runtime uses the exported
+    preprocessing values/mappings and the same feature column names.
+    """
     cmap = build_column_map(df)
-    out = pd.DataFrame(index=df.index)
+    X = pd.DataFrame(index=df.index)
 
-    numeric_fields = [
-        "department_id", "class_id", "line_id", "site", "mil", "flm", "dc_flm",
-        "cost", "retail", "gm_pct", "l30", "d30", "d60", "lw", "ttm", "qoh", "supply",
-        "allocated", "intrans", "store_transfer", "qty_reserve", "store_po_qty", "dc_qoh",
-        "dc_avail", "dc_staged", "dc_rv", "dc_po_qty", "avg_woc", "days", "proj_demand",
-        "alloc_rec", "left_dc", "final_supply", "demand_check", "helper",
-    ]
-    for f in numeric_fields:
-        out[f"num__{f}"] = _num(df, cmap, f, 0).fillna(0)
+    # Direct numeric/categorical signals.
+    for f in NUMERIC_FIELDS:
+        X[f'num__{f}'] = _num(df, cmap, f, 0).fillna(0)
+    for f in CATEGORICAL_FIELDS:
+        X[f'cat__{f}'] = _txt(df, cmap, f, '').fillna('').astype(str)
 
-    flm = out["num__flm"].replace(0, np.nan).fillna(1).clip(lower=1).round()
-    supply = out["num__supply"].fillna(0).clip(lower=0)
-    qoh = out["num__qoh"].fillna(0).clip(lower=0)
-    d60 = out["num__d60"].fillna(0).clip(lower=0)
-    d30 = out["num__d30"].fillna(0).clip(lower=0)
-    l30 = out["num__l30"].fillna(0).clip(lower=0)
-    lw = out["num__lw"].fillna(0).clip(lower=0)
-    ttm = out["num__ttm"].fillna(0).clip(lower=0)
-    proj = out["num__proj_demand"].fillna(0).clip(lower=0)
-    alloc_rec = out["num__alloc_rec"].fillna(0).clip(lower=0)
-    dc_avail = out["num__dc_avail"].fillna(0).clip(lower=0)
-    left_dc = out["num__left_dc"].fillna(0).clip(lower=0)
+    flag = _txt(df, cmap, 'flag')
+    section = pd.Series(_flag_section(flag), index=df.index)
+    X['cat__section_type'] = section.astype(str)
+    X['num__is_allocate_flag'] = (section == 'allocate').astype(float)
+    X['num__is_review_flag'] = (section == 'review').astype(float)
+    X['num__is_z_no_alloc_flag'] = (section == 'z_no_alloc').astype(float)
 
-    demand_basis = np.maximum.reduce([
-        d60.values, proj.values, (l30 * 2.0).values, (d30 * 2.0).values,
-        (ttm / 6.0).values, (lw * 8.0).values,
-    ])
-    out["num__demand_basis"] = demand_basis
-    out["num__need_gap"] = np.maximum(0, demand_basis - supply)
-    out["num__need_units"] = out["num__need_gap"] / (flm + EPS)
-    out["num__demand_cap"] = np.maximum(0, out["num__demand_basis"] + flm - supply)
-    out["num__demand_cap_units"] = out["num__demand_cap"] / (flm + EPS)
-    out["num__alloc_rec_units"] = alloc_rec / (flm + EPS)
-    out["num__dc_units_available"] = dc_avail / (flm + EPS)
-    out["num__left_dc_units"] = left_dc / (flm + EPS)
-    out["num__leftover_below_flm"] = ((left_dc > 0) & (left_dc < flm)).astype(float)
-    out["num__leftover_units_ratio"] = left_dc / (flm + EPS)
+    flm = _num(df, cmap, 'flm', 1).fillna(1).clip(lower=1)
+    d60 = _num(df, cmap, 'd60', 0).fillna(0)
+    d30 = _num(df, cmap, 'd30', 0).fillna(0)
+    l30 = _num(df, cmap, 'l30', 0).fillna(0)
+    lw = _num(df, cmap, 'lw', 0).fillna(0)
+    ttm = _num(df, cmap, 'ttm', 0).fillna(0)
+    proj = _num(df, cmap, 'proj_demand', 0).fillna(0)
+    supply = _num(df, cmap, 'supply', 0).fillna(0)
+    qoh = _num(df, cmap, 'qoh', 0).fillna(0)
+    alloc_rec = _num(df, cmap, 'alloc_rec', 0).fillna(0)
+    left_dc = _num(df, cmap, 'left_dc', 0).fillna(0)
+    dc_avail = _num(df, cmap, 'dc_avail', 0).fillna(0)
+    final_alloc = _num(df, cmap, 'final_alloc', 0).fillna(0)
+    cost = _num(df, cmap, 'cost', 0).fillna(0)
+    retail = _num(df, cmap, 'retail', 0).fillna(0)
 
-    # Demand/velocity relationships.
-    out["num__supply_to_demand"] = _safe_div(supply, demand_basis)
-    out["num__qoh_to_demand"] = _safe_div(qoh, demand_basis)
-    out["num__dc_to_need"] = _safe_div(dc_avail, out["num__need_gap"])
-    out["num__need_to_dc"] = _safe_div(out["num__need_gap"], dc_avail)
-    out["num__proj_to_d60"] = _safe_div(proj, d60)
-    out["num__l30_to_d60"] = _safe_div(l30, d60)
-    out["num__d30_to_d60"] = _safe_div(d30, d60)
-    out["num__lw_to_l30"] = _safe_div(lw, l30)
-    out["num__ttm_monthly"] = ttm / 12.0
-    out["num__ttm_60day"] = ttm / 6.0
-    out["num__recent_velocity_blend"] = 0.45 * l30 + 0.25 * d30 + 0.20 * (d60 / 2.0) + 0.10 * (lw * 4.29)
+    demand_basis = pd.Series(np.maximum.reduce([d60, proj, l30*2, d30*2, ttm/6, lw*8]), index=df.index).fillna(0)
+    need_gap = (demand_basis - supply).clip(lower=0)
+    dc_start = pd.Series(np.maximum(left_dc + final_alloc, dc_avail), index=df.index).fillna(0)
 
-    # Allocation recommendation relationships.
-    out["num__alloc_rec_to_need"] = _safe_div(alloc_rec, out["num__need_gap"])
-    out["num__alloc_rec_to_dc"] = _safe_div(alloc_rec, dc_avail)
-    out["num__alloc_rec_to_proj"] = _safe_div(alloc_rec, proj)
-    out["num__supply_after_alloc_rec"] = supply + alloc_rec
-    out["num__over_demand_after_alloc_rec"] = np.maximum(0, out["num__supply_after_alloc_rec"] - demand_basis)
-    out["num__margin_dollars"] = out["num__retail"].fillna(0) - out["num__cost"].fillna(0)
-    out["num__alloc_rec_retail_value"] = alloc_rec * out["num__retail"].fillna(0)
-    out["num__alloc_rec_margin_value"] = alloc_rec * out["num__margin_dollars"].fillna(0)
+    X['num__demand_basis'] = demand_basis
+    X['num__need_gap'] = need_gap
+    X['num__need_units'] = safe_div(need_gap, flm)
+    X['num__demand_cap'] = (demand_basis + flm - supply).clip(lower=0)
+    X['num__demand_cap_units'] = safe_div(X['num__demand_cap'], flm)
+    X['num__alloc_rec_units'] = safe_div(alloc_rec, flm)
+    X['num__dc_units_available'] = safe_div(dc_start, flm)
+    X['num__left_dc_units'] = safe_div(left_dc, flm)
+    X['num__leftover_below_flm'] = ((left_dc > 0) & (left_dc < flm)).astype(float)
+    X['num__leftover_units_ratio'] = safe_div(left_dc, flm)
+    X['num__supply_to_demand'] = safe_div(supply, demand_basis)
+    X['num__qoh_to_demand'] = safe_div(qoh, demand_basis)
+    X['num__dc_to_need'] = safe_div(dc_start, need_gap)
+    X['num__need_to_dc'] = safe_div(need_gap, dc_start)
+    X['num__proj_to_d60'] = safe_div(proj, d60)
+    X['num__l30_to_d60'] = safe_div(l30, d60)
+    X['num__d30_to_d60'] = safe_div(d30, d60)
+    X['num__lw_to_l30'] = safe_div(lw, l30)
+    X['num__ttm_monthly'] = ttm / 12.0
+    X['num__ttm_60day'] = ttm / 6.0
 
-    # Flags.
-    flag = _txt(df, cmap, "flag")
-    is_alloc, is_review, is_z = _flag_masks(flag)
-    out["num__is_allocate_flag"] = is_alloc.astype(float)
-    out["num__is_review_flag"] = is_review.astype(float)
-    out["num__is_z_no_alloc_flag"] = is_z.astype(float)
+    # ------------------------------------------------------------------
+    # Demand-focused feature engineering
+    # ------------------------------------------------------------------
+    # These features intentionally expand the relationships among the demand
+    # columns most relevant to allocation decisions: L30, D30, D60, LW and TTM.
+    # They help the model distinguish true sustained demand from short spikes,
+    # recent acceleration, seasonality, and demand consistency.
+    d30_per_30 = d30
+    d60_per_30 = d60 / 2.0
+    ttm_per_30 = ttm / 12.0
+    lw_monthly = lw * 4.29
+    lw_60day = lw * 8.58
+    l30_60day = l30 * 2.0
+    d30_60day = d30 * 2.0
 
-    # Pre-allocation DC features.
-    out = pd.concat([out, reconstruct_dc_before(df, cmap)], axis=1)
-    out["num__dc_before_units"] = out["num__dc_before_row"] / (flm + EPS)
-    out["num__need_to_dc_before"] = _safe_div(out["num__need_gap"], out["num__dc_before_row"])
-    out["num__alloc_rec_to_dc_before"] = _safe_div(alloc_rec, out["num__dc_before_row"])
-    out["num__section_has_partial_dc_before"] = ((out["num__dc_before_row"] > 0) & (out["num__dc_before_row"] < flm)).astype(float)
+    X['num__demand_l30_per_30'] = l30
+    X['num__demand_d30_per_30'] = d30_per_30
+    X['num__demand_d60_per_30'] = d60_per_30
+    X['num__demand_lw_monthly'] = lw_monthly
+    X['num__demand_ttm_per_30'] = ttm_per_30
+    X['num__demand_lw_60day_equiv'] = lw_60day
+    X['num__demand_l30_60day_equiv'] = l30_60day
+    X['num__demand_d30_60day_equiv'] = d30_60day
 
-    # Categorical identity fields.
-    cat_fields = [
-        "vendor", "vendor_site_id", "brand", "department_id", "class_id", "line_id", "product_id",
-        "item", "description", "upc", "site", "site_name", "state", "region", "zone", "store_size", "rank", "flag",
-    ]
-    for f in cat_fields:
-        out[f"cat__{f}"] = _txt(df, cmap, f)
+    # Recent trend / acceleration signals. Positive values indicate recent demand
+    # is running ahead of longer-window demand.
+    X['num__demand_l30_minus_d60_per30'] = l30 - d60_per_30
+    X['num__demand_d30_minus_d60_per30'] = d30_per_30 - d60_per_30
+    X['num__demand_lw_monthly_minus_l30'] = lw_monthly - l30
+    X['num__demand_l30_minus_ttm_monthly'] = l30 - ttm_per_30
+    X['num__demand_d60_per30_minus_ttm_monthly'] = d60_per_30 - ttm_per_30
+    X['num__demand_recent_acceleration'] = (l30 - d60_per_30) + 0.5 * (lw_monthly - l30)
+    X['num__demand_recent_vs_baseline_delta'] = ((l30 + d30_per_30 + lw_monthly) / 3.0) - ((d60_per_30 + ttm_per_30) / 2.0)
 
-    item = out["cat__item"].replace("", "__missing_item__")
-    site = out["cat__site"].replace("", "__missing_site__")
-    dept = out["cat__department_id"].replace("", "__missing_department__")
-    cls = out["cat__class_id"].replace("", "__missing_class__")
-    flag_section = pd.Series(np.where(is_review, "review", np.where(is_z, "z_no_alloc", np.where(is_alloc, "allocate", "other"))), index=df.index)
-    out["cat__section_type"] = flag_section
-    out["cat__item_site_section"] = item.astype(str) + "|" + site.astype(str) + "|" + flag_section.astype(str)
-    out["cat__dept_class_section"] = dept.astype(str) + "|" + cls.astype(str) + "|" + flag_section.astype(str)
+    # Ratios across horizons. These are clipped later by the preprocessing path
+    # after inf/nan cleanup.
+    X['num__demand_l30_to_d30'] = safe_div(l30, d30_per_30)
+    X['num__demand_l30_to_d60_per30'] = safe_div(l30, d60_per_30)
+    X['num__demand_d30_to_d60_per30'] = safe_div(d30_per_30, d60_per_30)
+    X['num__demand_lw_monthly_to_l30'] = safe_div(lw_monthly, l30)
+    X['num__demand_lw_monthly_to_d60_per30'] = safe_div(lw_monthly, d60_per_30)
+    X['num__demand_l30_to_ttm_monthly'] = safe_div(l30, ttm_per_30)
+    X['num__demand_d60_per30_to_ttm_monthly'] = safe_div(d60_per_30, ttm_per_30)
+
+    # Consensus / stability.  High consistency means the demand windows broadly
+    # agree; high volatility/spike scores mean the allocation should be handled
+    # more carefully.
+    demand_matrix = np.vstack([
+        np.asarray(l30, dtype=float),
+        np.asarray(d30_per_30, dtype=float),
+        np.asarray(d60_per_30, dtype=float),
+        np.asarray(lw_monthly, dtype=float),
+        np.asarray(ttm_per_30, dtype=float),
+    ]).T
+    X['num__demand_window_mean'] = np.nanmean(demand_matrix, axis=1)
+    X['num__demand_window_median'] = np.nanmedian(demand_matrix, axis=1)
+    X['num__demand_window_max'] = np.nanmax(demand_matrix, axis=1)
+    X['num__demand_window_min'] = np.nanmin(demand_matrix, axis=1)
+    X['num__demand_window_range'] = X['num__demand_window_max'] - X['num__demand_window_min']
+    X['num__demand_window_std'] = np.nanstd(demand_matrix, axis=1)
+    X['num__demand_window_cv'] = safe_div(X['num__demand_window_std'], X['num__demand_window_mean'])
+    X['num__demand_consistency_score'] = safe_div(X['num__demand_window_mean'], X['num__demand_window_mean'] + X['num__demand_window_std'])
+    X['num__demand_spike_score'] = safe_div(X['num__demand_window_max'] - X['num__demand_window_median'], X['num__demand_window_median'])
+    X['num__demand_zero_window_count'] = (pd.DataFrame(demand_matrix, index=df.index).fillna(0) <= 0).sum(axis=1).astype(float)
+
+    # Weighted demand consensus. Recent windows matter most, but TTM/D60 keep
+    # the model anchored to sustained demand.
+    X['num__demand_recent_velocity_blend'] = (0.35*l30 + 0.25*d30_per_30 + 0.25*lw_monthly + 0.10*d60_per_30 + 0.05*ttm_per_30)
+    X['num__recent_velocity_blend'] = X['num__demand_recent_velocity_blend']
+    X['num__demand_balanced_consensus'] = (0.30*l30 + 0.25*d30_per_30 + 0.20*d60_per_30 + 0.15*lw_monthly + 0.10*ttm_per_30)
+    X['num__demand_conservative_consensus'] = (0.20*l30 + 0.20*d30_per_30 + 0.30*d60_per_30 + 0.05*lw_monthly + 0.25*ttm_per_30)
+    X['num__demand_aggressive_consensus'] = (0.40*l30 + 0.25*d30_per_30 + 0.25*lw_monthly + 0.10*d60_per_30)
+
+    # Demand-to-inventory/pack-size features. These make the model more aware of
+    # how many FLM packs are actually justified by each demand horizon.
+    for _name, _metric in {
+        'l30': l30,
+        'd30': d30_per_30,
+        'd60_per30': d60_per_30,
+        'lw_monthly': lw_monthly,
+        'ttm_monthly': ttm_per_30,
+        'balanced_consensus': X['num__demand_balanced_consensus'],
+        'aggressive_consensus': X['num__demand_aggressive_consensus'],
+    }.items():
+        X[f'num__{_name}_demand_units'] = safe_div(_metric, flm)
+        X[f'num__{_name}_demand_gap'] = (_metric - supply).clip(lower=0)
+        X[f'num__{_name}_demand_gap_units'] = safe_div(X[f'num__{_name}_demand_gap'], flm)
+        X[f'num__{_name}_supply_coverage'] = safe_div(supply, _metric)
+        X[f'num__{_name}_qoh_coverage'] = safe_div(qoh, _metric)
+
+    X['num__alloc_rec_to_need'] = safe_div(alloc_rec, need_gap)
+    X['num__alloc_rec_to_dc'] = safe_div(alloc_rec, dc_start)
+    X['num__alloc_rec_to_proj'] = safe_div(alloc_rec, proj)
+    X['num__supply_after_alloc_rec'] = supply + alloc_rec
+    X['num__over_demand_after_alloc_rec'] = ((supply + alloc_rec) - demand_basis).clip(lower=0)
+    X['num__margin_dollars'] = retail - cost
+    X['num__alloc_rec_retail_value'] = alloc_rec * retail
+    X['num__alloc_rec_margin_value'] = alloc_rec * (retail - cost)
+
+    # Pre-allocation DC reconstruction: historical left DC was already after Final Alloc; add back final_alloc.
+    X['num__dc_start_pool_estimated'] = dc_start
+    X['num__dc_before_left_plus_final'] = left_dc + final_alloc
+    X['num__dc_before_units'] = safe_div(dc_start, flm)
+    X['num__need_to_dc_before'] = safe_div(need_gap, dc_start)
+    X['num__alloc_rec_to_dc_before'] = safe_div(alloc_rec, dc_start)
+    X['num__section_has_partial_dc_before'] = ((dc_start > 0) & (dc_start < flm)).astype(float)
+
+    # Group/section features.
+    item = _txt(df, cmap, 'item').replace('', '__missing_item__')
+    site = _txt(df, cmap, 'site').replace('', '__missing_site__')
+    dept = _txt(df, cmap, 'department_id').replace('', '__missing_dept__')
+    cls = _txt(df, cmap, 'class_id').replace('', '__missing_class__')
+    item_site = item.astype(str) + '|' + site.astype(str)
+    dept_class = dept.astype(str) + '|' + cls.astype(str)
+    item_section = item.astype(str) + '|' + section.astype(str)
+    X['cat__item_site_section'] = item_site + '|' + section.astype(str)
+    X['cat__dept_class_section'] = dept_class + '|' + section.astype(str)
 
     def add_group(prefix: str, key: pd.Series):
-        g = out.groupby(key, sort=False)
-        rows = g["num__demand_basis"].transform("size").astype(float)
-        tot_demand = g["num__demand_basis"].transform("sum")
-        tot_need = g["num__need_gap"].transform("sum")
-        tot_rec = g["num__alloc_rec"].transform("sum")
-        tot_supply = g["num__supply"].transform("sum")
-        tot_dc_before = g["num__dc_before_row"].transform("max")
-        out[f"num__{prefix}_rows"] = rows
-        out[f"num__{prefix}_total_demand"] = tot_demand
-        out[f"num__{prefix}_share_demand"] = _safe_div(out["num__demand_basis"], tot_demand)
-        out[f"num__{prefix}_total_need"] = tot_need
-        out[f"num__{prefix}_share_need"] = _safe_div(out["num__need_gap"], tot_need)
-        out[f"num__{prefix}_total_alloc_rec"] = tot_rec
-        out[f"num__{prefix}_share_alloc_rec"] = _safe_div(out["num__alloc_rec"], tot_rec)
-        out[f"num__{prefix}_total_supply"] = tot_supply
-        out[f"num__{prefix}_share_supply"] = _safe_div(out["num__supply"], tot_supply)
-        out[f"num__{prefix}_total_dc_before"] = tot_dc_before
-        out[f"num__{prefix}_need_to_dc_pressure"] = _safe_div(tot_need, tot_dc_before)
-        out[f"num__{prefix}_dc_to_need_ratio"] = _safe_div(tot_dc_before, tot_need)
-        out[f"num__{prefix}_alloc_rec_to_dc_pressure"] = _safe_div(tot_rec, tot_dc_before)
+        grp = pd.DataFrame({'key': key.astype(str), 'demand': demand_basis, 'need': need_gap, 'alloc_rec': alloc_rec, 'supply': supply, 'dc': dc_start}, index=df.index)
+        g = grp.groupby('key')
+        rows = g['key'].transform('size').astype(float)
+        X[f'num__{prefix}_rows'] = rows
+        for col in ['demand','need','alloc_rec','supply','dc']:
+            total = g[col].transform('sum').replace(0, np.nan)
+            X[f'num__{prefix}_total_{col if col != "dc" else "dc_before"}'] = total.fillna(0)
+            X[f'num__{prefix}_share_{col if col != "dc" else "dc"}'] = safe_div(grp[col], total)
+        X[f'num__{prefix}_need_to_dc_pressure'] = safe_div(g['need'].transform('sum'), g['dc'].transform('sum'))
+        X[f'num__{prefix}_dc_to_need_ratio'] = safe_div(g['dc'].transform('sum'), g['need'].transform('sum'))
+        X[f'num__{prefix}_alloc_rec_to_dc_pressure'] = safe_div(g['alloc_rec'].transform('sum'), g['dc'].transform('sum'))
 
-    # Section-level context: these are the key shift away from row-by-row training.
-    add_group("item", item)
-    add_group("site", site)
-    add_group("department", dept)
-    add_group("class", cls)
-    add_group("item_site", item.astype(str) + "|" + site.astype(str))
-    add_group("dept_class", dept.astype(str) + "|" + cls.astype(str))
-    add_group("item_section", item.astype(str) + "|" + flag_section.astype(str))
-    add_group("item_site_section", item.astype(str) + "|" + site.astype(str) + "|" + flag_section.astype(str))
-    add_group("dept_class_section", dept.astype(str) + "|" + cls.astype(str) + "|" + flag_section.astype(str))
+    add_group('item', item)
+    add_group('site', site)
+    add_group('department', dept)
+    add_group('class', cls)
+    add_group('item_site', item_site)
+    add_group('dept_class', dept_class)
+    add_group('item_section', item_section)
 
-    # Item/section ranking and cumulative pressure in original row order.
-    def add_rank_cum(prefix: str, key: pd.Series):
-        for metric, source in [
-            ("need", out["num__need_gap"]),
-            ("demand", out["num__demand_basis"]),
-            ("alloc_rec", out["num__alloc_rec"]),
-            ("dc_before", out["num__dc_before_row"]),
-            ("recent_velocity", out["num__recent_velocity_blend"]),
-        ]:
-            out[f"num__{prefix}_rank_{metric}_descending"] = source.groupby(key, sort=False).rank(method="first", ascending=False)
-            out[f"num__{prefix}_pct_rank_{metric}"] = source.groupby(key, sort=False).rank(method="first", ascending=False, pct=True).fillna(1.0)
-            out[f"num__{prefix}_cum_{metric}_before"] = source.groupby(key, sort=False).cumsum() - source
-            total = source.groupby(key, sort=False).transform("sum")
-            out[f"num__{prefix}_remaining_{metric}_after"] = total - source.groupby(key, sort=False).cumsum()
+    # Ranking/cumulative features within item and within item-section.
+    def add_rank(prefix: str, key: pd.Series, metric_name: str, metric: pd.Series, descending=True):
+        tmp = pd.DataFrame({'key': key.astype(str), 'metric': metric.fillna(0), 'order': df.get('__row_order', pd.Series(range(len(df)), index=df.index))}, index=df.index)
+        ascending = not descending
+        # rank 1 = largest need/demand/etc.
+        X[f'num__{prefix}_rank_{metric_name}_descending'] = tmp.groupby('key')['metric'].rank(method='first', ascending=False)
+        X[f'num__{prefix}_pct_rank_{metric_name}'] = tmp.groupby('key')['metric'].rank(pct=True, method='average')
+        X[f'num__{prefix}_cum_{metric_name}_before'] = tmp.groupby('key')['metric'].cumsum() - tmp['metric']
+        X[f'num__{prefix}_remaining_{metric_name}_after'] = tmp.groupby('key')['metric'].transform('sum') - tmp.groupby('key')['metric'].cumsum()
 
-    add_rank_cum("item", item)
-    add_rank_cum("item_section", item.astype(str) + "|" + flag_section.astype(str))
+    for keyname, key in [('item', item), ('item_section', item_section)]:
+        add_rank(keyname, key, 'need', need_gap)
+        add_rank(keyname, key, 'demand', demand_basis)
+        add_rank(keyname, key, 'alloc_rec', alloc_rec)
+        add_rank(keyname, key, 'dc_before', dc_start)
+        add_rank(keyname, key, 'recent_velocity', X['num__recent_velocity_blend'])
+        add_rank(keyname, key, 'balanced_consensus', X['num__demand_balanced_consensus'])
+        add_rank(keyname, key, 'demand_acceleration', X['num__demand_recent_acceleration'])
+        add_rank(keyname, key, 'demand_consistency', X['num__demand_consistency_score'])
 
-    out = out.replace([np.inf, -np.inf], np.nan)
-    return out.copy()  # defragment after extensive feature construction
+    # Ensure no infs leak into model preprocessing.
+    for c in X.columns:
+        if c.startswith('num__'):
+            X[c] = pd.to_numeric(X[c], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0)
+        else:
+            X[c] = X[c].fillna('').astype(str)
+    return X
 
-
-def build_targets(df: pd.DataFrame, max_units: int = 240) -> pd.DataFrame:
+def build_targets(df: pd.DataFrame) -> pd.DataFrame:
     cmap = build_column_map(df)
-    final_alloc = _num(df, cmap, "final_alloc", 0).fillna(0).clip(lower=0)
-    flm = _num(df, cmap, "flm", 1).fillna(1).where(lambda s: s > 0, 1).round()
-    units = np.rint(final_alloc / (flm + EPS)).astype(int).clip(0, max_units)
-    alloc = (final_alloc > 0).astype(int)
-    flag = _txt(df, cmap, "flag")
-    is_alloc, is_review, is_z = _flag_masks(flag)
-    feats = build_feature_frame(df)
-
-    need_units = pd.to_numeric(feats.get("num__need_units", 0), errors="coerce").fillna(0)
-    rec_units = pd.to_numeric(feats.get("num__alloc_rec_units", 0), errors="coerce").fillna(0)
-    dc_before_units = pd.to_numeric(feats.get("num__dc_before_units", 0), errors="coerce").fillna(0)
-    pct_rank_need = pd.to_numeric(feats.get("num__item_section_pct_rank_need", 1), errors="coerce").fillna(1)
-
-    # Priority target for section-by-section allocation. Positive historical rows rise
-    # first; among all rows, high need/alloc-rec and high within-section rank get credit.
-    priority = (
-        0.58 * alloc.astype(float)
-        + 0.18 * np.tanh(need_units / 3.0)
-        + 0.14 * np.tanh(rec_units / 3.0)
-        + 0.06 * np.tanh(dc_before_units / 5.0)
-        + 0.04 * (1.0 - pct_rank_need.clip(0, 1))
-    ).clip(0, 1)
-
+    flm = _num(df, cmap, 'flm', 1).fillna(1).clip(lower=1)
+    final_alloc = _num(df, cmap, 'final_alloc', 0).fillna(0).clip(lower=0)
+    units = np.floor(final_alloc / flm).clip(lower=0).astype(int)
+    flag = _txt(df, cmap, 'flag')
+    section = pd.Series(_flag_section(flag), index=df.index)
+    # Priority target for ranking: actual units + demand pressure. Positive rows dominate.
+    X = build_feature_frame(df)
+    priority = (units > 0).astype(float) * 0.7 + pd.to_numeric(X.get('num__need_to_dc_before', 0), errors='coerce').fillna(0).clip(0, 3) / 3 * 0.3
     return pd.DataFrame({
-        "__target_final_alloc": final_alloc.astype(float),
-        "__target_units": units.astype(int),
-        "__target_alloc": alloc.astype(int),
-        "__target_priority": np.asarray(priority, dtype=float),
-        "__is_allocate": is_alloc.astype(int),
-        "__is_review": is_review.astype(int),
-        "__is_z_no_alloc": is_z.astype(int),
-        "__section_type": np.where(is_review, "review", np.where(is_z, "z_no_alloc", np.where(is_alloc, "allocate", "other"))),
+        '__target_units': units.astype(int),
+        '__target_allocated': (final_alloc > 0).astype(int),
+        '__target_priority': priority.astype(float),
+        '__section_type': section.astype(str),
     }, index=df.index)
-
-
-def feature_columns(data: pd.DataFrame) -> list[str]:
-    return [c for c in data.columns if c.startswith("num__") or c.startswith("cat__")]
-
-
-def split_three_model_datasets(data: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    return {
-        "Base Allocation": data[data["__is_allocate"].astype(bool)].reset_index(drop=True),
-        "Base Review": data[data["__is_review"].astype(bool)].reset_index(drop=True),
-        "Base Z No Alloc": data[data["__is_z_no_alloc"].astype(bool)].reset_index(drop=True),
-    }
