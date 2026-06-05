@@ -28,8 +28,8 @@ ARTIFACT_NAME = "Base Allocation + Base Review"
 BASE_DIR = Path(__file__).parent if "__file__" in globals() else Path(".")
 
 MODEL_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_model.joblib",
-    "Base Review": BASE_DIR / "base_review_model.joblib",
+    "Base Allocation": BASE_DIR / "base_allocation_numpy_model.joblib",
+    "Base Review": BASE_DIR / "base_review_numpy_model.joblib",
 }
 METADATA_FILES = {
     "Base Allocation": BASE_DIR / "base_allocation_model_metadata.json",
@@ -145,8 +145,35 @@ with st.sidebar:
     st.header("Performance")
     chunk_size = st.select_slider("Prediction chunk size", options=[500, 1000, 2500, 5000, 10000], value=2500)
 
+    with st.expander("What do these settings mean?", expanded=True):
+        st.markdown(
+            """
+            **Use trained model thresholds**: Uses the validation-tested threshold saved with each model. Turn this off only when you want to manually make the AI more or less aggressive.
+
+            **Base Allocation threshold**: Minimum confidence needed for rows flagged `Allocate`. Higher values produce fewer allocations; lower values produce more.
+
+            **Base Review threshold**: Minimum confidence needed for rows flagged `Review`. Review rows are also ranked by priority before consuming DC.
+
+            **Demand cap extra FLM**: Safety buffer above demand. A value of `1.0` means the simulator can allow roughly one extra FLM beyond the demand cap when justified.
+
+            **Alloc. Rec. influence**: Controls how much the workbook's `Alloc. Rec.` column constrains final output. `feature_only` only lets the model learn from it; `hard_cap` makes it a strict cap.
+
+            **Prefer Left DC over DC Avail**: Uses the workbook's `Left DC` as the starting inventory pool when available. This is usually best because it reflects the allocation worksheet.
+
+            **Allow below-FLM leftover allocation**: If remaining DC is positive but less than one FLM, the app can allocate that exact leftover amount instead of rounding to blank.
+
+            **Review ranking weights**: Blend the Review model's priority score, probability score, and need score. Higher priority weight means the Review ranking model controls more of the ordering.
+
+            **Give below-FLM Review leftover to one top row**: Assigns the final below-FLM leftover to one highest-priority Review row rather than splitting it.
+
+            **Minimum Review priority for below-FLM leftover**: Minimum blended Review score required before the leftover is assigned.
+
+            **Prediction chunk size**: Controls how many rows are scored at once. Smaller values use less memory; larger values can be faster.
+            """
+        )
+
 st.title(APP_TITLE)
-st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system.")
+st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system. This version runs with NumPy-only model bundles and does not install scikit-learn.")
 
 predict_tab, insights_tab, model_tab, process_tab = st.tabs([
     "Predict Allocation",

@@ -44,12 +44,28 @@ def _joblib_part_paths(path: str | Path) -> list[Path]:
 
 
 def _load_joblib_with_split_support(path: str | Path):
+    """Load a NumPy-only joblib bundle, including split .partXX files.
+
+    This function intentionally catches ModuleNotFoundError for sklearn. That
+    means if an older sklearn-pickled model file is accidentally left in the
+    repo, the loader can skip it and continue looking for the NumPy-only model
+    instead of crashing the app.
+    """
     p = Path(path)
-    if p.exists():
-        return joblib.load(p)
-    parts = _joblib_part_paths(p)
-    if parts:
-        return joblib.load(io.BytesIO(b"".join(part.read_bytes() for part in parts)))
+    try:
+        if p.exists():
+            return joblib.load(p)
+        parts = _joblib_part_paths(p)
+        if parts:
+            return joblib.load(io.BytesIO(b"".join(part.read_bytes() for part in parts)))
+    except ModuleNotFoundError as exc:
+        if "sklearn" in str(exc).lower():
+            raise ValueError(
+                f"{p.name} appears to be an old sklearn-pickled model. "
+                "This app requires the NumPy-only converted model files. "
+                "Use base_allocation_numpy_model.joblib and base_review_numpy_model.joblib."
+            ) from exc
+        raise
     raise FileNotFoundError(f"Could not find model file {p} or split parts like {p.name}.part01")
 
 
@@ -80,19 +96,46 @@ def load_two_models(folder_or_zip: str | Path | None = None) -> Dict[str, dict]:
 
 
 def _load_models_from_dir(root: Path) -> Dict[str, dict]:
-    paths = {
-        "Base Allocation": Path(root) / "base_allocation_model.joblib",
-        "Base Review": Path(root) / "base_review_model.joblib",
+    """Load the built-in NumPy-only Base Allocation and Base Review models.
+
+    The preferred filenames deliberately include `_numpy_` so they do not collide
+    with older sklearn-pickled model artifacts that may remain in a GitHub repo
+    after an update. Older filenames are tried only as a fallback and are skipped
+    if they require sklearn.
+    """
+    candidate_paths = {
+        "Base Allocation": [
+            Path(root) / "base_allocation_numpy_model.joblib",
+            Path(root) / "base_allocation_model.joblib",
+        ],
+        "Base Review": [
+            Path(root) / "base_review_numpy_model.joblib",
+            Path(root) / "base_review_model.joblib",
+        ],
     }
-    models = {}
-    for label, path in paths.items():
-        if path.exists() or _joblib_part_paths(path):
-            bundle = _load_bundle(path)
-            bundle["__model_file"] = str(path)
-            models[label] = bundle
-    missing = [k for k in paths if k not in models]
+    models: Dict[str, dict] = {}
+    load_errors: Dict[str, list[str]] = {}
+    for label, paths in candidate_paths.items():
+        load_errors[label] = []
+        for path in paths:
+            if not (path.exists() or _joblib_part_paths(path)):
+                continue
+            try:
+                bundle = _load_bundle(path)
+                bundle["__model_file"] = str(path)
+                models[label] = bundle
+                break
+            except Exception as exc:
+                load_errors[label].append(f"{path.name}: {type(exc).__name__}: {exc}")
+        if label not in models:
+            load_errors[label].append("No usable NumPy-only model file found.")
+    missing = [k for k in candidate_paths if k not in models]
     if missing:
-        raise FileNotFoundError(f"Missing required model(s): {missing}. Expected Base Allocation and Base Review model files in {root}.")
+        details = "; ".join(f"{k} -> " + " | ".join(load_errors.get(k, [])) for k in missing)
+        raise FileNotFoundError(
+            f"Missing required NumPy-only model(s): {missing}. Details: {details}. "
+            "Confirm the repo includes base_allocation_numpy_model.joblib and base_review_numpy_model.joblib."
+        )
     return models
 
 
