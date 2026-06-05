@@ -4,7 +4,6 @@ import io
 import json
 import zipfile
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,50 +13,86 @@ from data_io import dataframe_to_csv_bytes, read_allocation_file, save_upload
 from schema import ColumnDiagnostics, build_column_map
 from two_model_prediction_system import (
     TwoPredictionConfig,
-    load_two_models,
+    load_two_models_from_paths,
     model_feature_importance,
     predict_allocation_file,
     prediction_feature_relationships,
     read_json,
 )
 
-st.set_page_config(page_title="Allocation AI · Base Allocation + Base Review · sklearn-free", page_icon="🎯", layout="wide")
+st.set_page_config(
+    page_title="Allocation AI · Base Model v1/v2",
+    page_icon="🎯",
+    layout="wide",
+)
 
-APP_TITLE = "🎯 Allocation AI · Two-Model Predictor"
-ARTIFACT_NAME = "Base Allocation + Base Review"
+APP_TITLE = "🎯 Allocation AI · Base Model v1 / v2 Predictor"
 BASE_DIR = Path(__file__).parent if "__file__" in globals() else Path(".")
 
-MODEL_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_numpy_model.joblib",
-    "Base Review": BASE_DIR / "base_review_numpy_model.joblib",
+MODEL_PROFILES = {
+    "base_model_v1": {
+        "label": "Base Model v1 · Existing uploaded model",
+        "short_label": "Base Model v1",
+        "description": "Existing NumPy-only two-model package using Base Allocation + Base Review v7 artifacts.",
+        "allocate_model": "base_model_v1_allocate_model.joblib",
+        "review_model": "base_model_v1_review_model.joblib",
+        "allocate_metadata": "base_model_v1_allocate_model_metadata.json",
+        "review_metadata": "base_model_v1_review_model_metadata.json",
+        "summary": "base_model_v1_allocation_review_summary.json",
+        "allocate_sweep": "base_model_v1_allocate_threshold_sweep.csv",
+        "review_sweep": "base_model_v1_review_threshold_sweep.csv",
+        "allocate_progress": "base_model_v1_allocate_training_progress.csv",
+        "review_progress": "base_model_v1_review_training_progress.csv",
+        "allocate_validation": "base_model_v1_allocate_validation_predictions.csv",
+        "review_validation": "base_model_v1_review_validation_predictions.csv",
+        "allocate_backtest": "base_model_v1_allocate_workbook_backtest.json",
+        "review_backtest": "base_model_v1_review_workbook_backtest.json",
+    },
+    "base_model_v2": {
+        "label": "Base Model v2 · New v8 recall/scarcity/memory model",
+        "short_label": "Base Model v2",
+        "description": "Newer v8 NumPy-only model with counterfactual augmentation, store behavior memory, DC scarcity, reason codes, and Review recall recovery.",
+        "allocate_model": "base_model_v2_allocate_model.joblib",
+        "review_model": "base_model_v2_review_model.joblib",
+        "allocate_metadata": "base_model_v2_allocate_model_metadata.json",
+        "review_metadata": "base_model_v2_review_model_metadata.json",
+        "summary": "base_model_v2_allocation_review_summary.json",
+        "allocate_sweep": "base_model_v2_allocate_threshold_sweep.csv",
+        "review_sweep": "base_model_v2_review_threshold_sweep.csv",
+        "allocate_progress": "base_model_v2_allocate_training_progress.csv",
+        "review_progress": "base_model_v2_review_training_progress.csv",
+        "allocate_validation": "base_model_v2_allocate_validation_predictions.csv",
+        "review_validation": "base_model_v2_review_validation_predictions.csv",
+        "allocate_backtest": "base_model_v2_allocate_workbook_backtest.json",
+        "review_backtest": "base_model_v2_review_workbook_backtest.json",
+    },
 }
-METADATA_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_model_metadata.json",
-    "Base Review": BASE_DIR / "base_review_model_metadata.json",
-}
-SWEEP_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_threshold_sweep.csv",
-    "Base Review": BASE_DIR / "base_review_threshold_sweep.csv",
-}
-PROGRESS_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_training_progress.csv",
-    "Base Review": BASE_DIR / "base_review_training_progress.csv",
-}
-VALIDATION_FILES = {
-    "Base Allocation": BASE_DIR / "base_allocation_validation_predictions.csv",
-    "Base Review": BASE_DIR / "base_review_validation_predictions.csv",
-}
-SUMMARY_FILE = BASE_DIR / "base_allocation_base_review_summary.json"
+
+
+def _profile_path(profile_key: str, key: str) -> Path:
+    return BASE_DIR / MODEL_PROFILES[profile_key][key]
 
 
 @st.cache_resource(show_spinner=False)
-def cached_models():
-    return load_two_models(BASE_DIR)
+def cached_models(profile_key: str):
+    p = MODEL_PROFILES[profile_key]
+    return load_two_models_from_paths(BASE_DIR / p["allocate_model"], BASE_DIR / p["review_model"])
 
 
 @st.cache_data(show_spinner=False)
-def load_metadata():
-    return {label: read_json(path) for label, path in METADATA_FILES.items()}, read_json(SUMMARY_FILE)
+def load_profile_metadata(profile_key: str):
+    return {
+        "Base Allocation": read_json(_profile_path(profile_key, "allocate_metadata")),
+        "Base Review": read_json(_profile_path(profile_key, "review_metadata")),
+    }, read_json(_profile_path(profile_key, "summary"))
+
+
+@st.cache_data(show_spinner=False)
+def load_all_profile_metadata():
+    out = {}
+    for key in MODEL_PROFILES:
+        out[key] = load_profile_metadata(key)
+    return out
 
 
 def _fmt(x, digits=3, default="—"):
@@ -72,11 +107,13 @@ def _fmt(x, digits=3, default="—"):
 def _metric_dict(meta: dict) -> dict:
     best = meta.get("best_validation_metrics", {}) if isinstance(meta, dict) else {}
     priority = meta.get("priority_validation_summary", {}) if isinstance(meta, dict) else {}
+    backtest = meta.get("workbook_like_backtest", {}) if isinstance(meta, dict) else {}
     return {
         "rows_total": meta.get("rows_total"),
         "rows_train": meta.get("rows_train"),
         "rows_validation": meta.get("rows_validation"),
         "positive_rows_total": meta.get("positive_rows_total"),
+        "negative_rows_total": meta.get("negative_rows_total"),
         "best_epoch": meta.get("best_epoch"),
         "best_threshold": meta.get("best_threshold", best.get("threshold")),
         "f1": best.get("f1"),
@@ -86,8 +123,20 @@ def _metric_dict(meta: dict) -> dict:
         "positive_unit_accuracy": best.get("positive_unit_accuracy"),
         "unit_mae": best.get("unit_mae"),
         "false_positive_rate": best.get("false_positive_rate"),
-        "priority_spread": priority.get("priority_spread_pos_minus_neg"),
+        "predicted_positive_rows": best.get("predicted_positive_rows"),
+        "actual_positive_rows": best.get("actual_positive_rows"),
+        "row_exact_match": backtest.get("row_exact_match"),
+        "row_near_match": backtest.get("row_near_match"),
+        "total_units_error": backtest.get("total_units_error"),
+        "priority_mean_positive": priority.get("priority_mean_positive"),
+        "priority_mean_negative": priority.get("priority_mean_negative"),
         "model_file_mb": meta.get("model_file_mb"),
+        "quantity_correction_enabled": meta.get("quantity_correction_enabled"),
+        "override_detector_enabled": meta.get("override_detector_enabled"),
+        "review_recall_recovery_enabled": meta.get("review_recall_recovery_enabled"),
+        "dc_scarcity_model_enabled": meta.get("dc_scarcity_model_enabled"),
+        "reason_code_model_enabled": meta.get("reason_code_model_enabled"),
+        "store_behavior_memory_enabled": meta.get("store_behavior_memory_enabled"),
     }
 
 
@@ -100,12 +149,6 @@ def _read_csv(path: Path) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _feature_family_summary(fi: pd.DataFrame) -> pd.DataFrame:
-    if fi.empty:
-        return pd.DataFrame()
-    return fi.groupby(["model", "feature_family"], as_index=False)["importance"].sum().sort_values("importance", ascending=False)
-
-
 def _safe_model_feature_importance(models: dict) -> pd.DataFrame:
     rows = []
     for label in ["Base Allocation", "Base Review"]:
@@ -116,15 +159,41 @@ def _safe_model_feature_importance(models: dict) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-metadata, summary_meta = load_metadata()
+def _feature_family_summary(fi: pd.DataFrame) -> pd.DataFrame:
+    if fi.empty:
+        return pd.DataFrame()
+    return fi.groupby(["model", "feature_family"], as_index=False)["importance"].sum().sort_values("importance", ascending=False)
+
+
+all_meta = load_all_profile_metadata()
 
 with st.sidebar:
-    st.header("Model system")
-    st.success("Built-in: Base Allocation + Base Review")
-    st.caption("Allocate rows and Review rows are handled by separate packaged MLP models. No Alloc / Z rows are ignored and left blank.")
+    st.header("Model version")
+    profile_key = st.selectbox(
+        "Choose base model",
+        list(MODEL_PROFILES.keys()),
+        index=1,
+        format_func=lambda k: MODEL_PROFILES[k]["label"],
+    )
+    profile = MODEL_PROFILES[profile_key]
+    metadata, summary_meta = all_meta[profile_key]
+    st.success(f"Selected: {profile['short_label']}")
+    st.caption(profile["description"])
+
+    with st.expander("Model files used", expanded=False):
+        st.code(
+            "\n".join([
+                profile["allocate_model"],
+                profile["review_model"],
+                profile["allocate_metadata"],
+                profile["review_metadata"],
+                profile["summary"],
+            ]),
+            language="text",
+        )
 
     st.header("Prediction controls")
-    use_model_thresholds = st.checkbox("Use trained model thresholds", value=True)
+    use_model_thresholds = st.checkbox("Use selected model thresholds", value=True)
     alloc_default = float(_metric_dict(metadata.get("Base Allocation", {})).get("best_threshold") or 0.90)
     review_default = float(_metric_dict(metadata.get("Base Review", {})).get("best_threshold") or 0.05)
     allocation_threshold = st.slider("Base Allocation threshold", 0.01, 0.99, min(max(alloc_default, 0.01), 0.99), 0.01, disabled=use_model_thresholds)
@@ -142,47 +211,24 @@ with st.sidebar:
     partial_single = st.checkbox("Give below-FLM Review leftover to one top row", value=True)
     partial_min_priority = st.slider("Minimum Review priority for below-FLM leftover", 0.0, 1.0, 0.50, 0.05)
 
-    st.header("Performance")
+    st.header("Advanced controls")
     chunk_size = st.select_slider("Prediction chunk size", options=[500, 1000, 2500, 5000, 10000], value=2500)
-
-    with st.expander("What do these settings mean?", expanded=True):
-        st.markdown(
-            """
-            **Use trained model thresholds**: Uses the validation-tested threshold saved with each model. Turn this off only when you want to manually make the AI more or less aggressive.
-
-            **Base Allocation threshold**: Minimum confidence needed for rows flagged `Allocate`. Higher values produce fewer allocations; lower values produce more.
-
-            **Base Review threshold**: Minimum confidence needed for rows flagged `Review`. Review rows are also ranked by priority before consuming DC.
-
-            **Demand cap extra FLM**: Safety buffer above demand. A value of `1.0` means the simulator can allow roughly one extra FLM beyond the demand cap when justified.
-
-            **Alloc. Rec. influence**: Controls how much the workbook's `Alloc. Rec.` column constrains final output. `feature_only` only lets the model learn from it; `hard_cap` makes it a strict cap.
-
-            **Prefer Left DC over DC Avail**: Uses the workbook's `Left DC` as the starting inventory pool when available. This is usually best because it reflects the allocation worksheet.
-
-            **Allow below-FLM leftover allocation**: If remaining DC is positive but less than one FLM, the app can allocate that exact leftover amount instead of rounding to blank.
-
-            **Review ranking weights**: Blend the Review model's priority score, probability score, and need score. Higher priority weight means the Review ranking model controls more of the ordering.
-
-            **Give below-FLM Review leftover to one top row**: Assigns the final below-FLM leftover to one highest-priority Review row rather than splitting it.
-
-            **Minimum Review priority for below-FLM leftover**: Minimum blended Review score required before the leftover is assigned.
-
-            **Prediction chunk size**: Controls how many rows are scored at once. Smaller values use less memory; larger values can be faster.
-            """
-        )
+    use_dc_optimizer = st.checkbox("Use DC allocation optimizer", value=True)
+    use_quantity_correction = st.checkbox("Use quantity correction model", value=True)
+    use_override_detector = st.checkbox("Use override detector", value=True)
 
 st.title(APP_TITLE)
-st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system. This version runs with NumPy-only model bundles exported from the latest trainer and does not install scikit-learn or TensorFlow.")
+st.caption("Upload an allocation workbook and select Base Model v1 or Base Model v2. Both model versions are included with unique filenames to avoid collisions.")
 
-predict_tab, insights_tab, model_tab, process_tab = st.tabs([
+tabs = st.tabs([
     "Predict Allocation",
     "Prediction Insights",
-    "Model Metrics",
-    "How It Works + Feature Guide",
+    "Model Comparison",
+    "Selected Model Metrics",
+    "How It Works",
 ])
 
-with predict_tab:
+with tabs[0]:
     st.markdown("## 1. Upload allocation file")
     uploaded = st.file_uploader("Upload `.xlsb`, `.xlsx`, or `.csv` allocation file", type=["xlsb", "xlsx", "csv"])
     sheet_name = st.text_input("Excel sheet name", value="3.3 Working Table")
@@ -198,6 +244,7 @@ with predict_tab:
                 st.dataframe(pd.DataFrame(diag.as_rows()), use_container_width=True, height=360)
 
             st.markdown("## 2. Run prediction")
+            st.info(f"Prediction will use **{profile['short_label']}**.")
             if st.button("Predict Final Alloc", type="primary"):
                 cfg = TwoPredictionConfig(
                     allocation_threshold=None if use_model_thresholds else float(allocation_threshold),
@@ -212,10 +259,15 @@ with predict_tab:
                     review_partial_leftover_to_single_row=bool(partial_single),
                     review_partial_leftover_min_priority=float(partial_min_priority),
                     prediction_chunk_size=int(chunk_size),
+                    use_dc_optimizer=bool(use_dc_optimizer),
+                    use_quantity_correction=bool(use_quantity_correction),
+                    use_override_detector=bool(use_override_detector),
                 )
-                with st.spinner("Loading models, scoring Allocate/Review sections, and simulating DC availability..."):
-                    models = cached_models()
+                with st.spinner(f"Loading {profile['short_label']}, scoring Allocate/Review sections, and simulating DC availability..."):
+                    models = cached_models(profile_key)
                     out_df, audit_df, run_summary = predict_allocation_file(df, models, cfg)
+                    run_summary["selected_model_profile"] = profile["short_label"]
+                    run_summary["selected_model_key"] = profile_key
                 try:
                     fi = _safe_model_feature_importance(models)
                 except Exception:
@@ -225,13 +277,14 @@ with predict_tab:
                 except Exception:
                     rel = pd.DataFrame()
 
+                st.session_state["selected_profile_key"] = profile_key
                 st.session_state["input_df"] = df
                 st.session_state["out_df"] = out_df
                 st.session_state["audit_df"] = audit_df
                 st.session_state["run_summary"] = run_summary
                 st.session_state["feature_importance"] = fi
                 st.session_state["feature_relationships"] = rel
-                st.success("Prediction complete. Final Alloc values are integer quantities or blank.")
+                st.success(f"Prediction complete using {profile['short_label']}. Final Alloc values are integer quantities or blank.")
         except Exception as exc:
             st.error("File loading or prediction setup failed.")
             st.exception(exc)
@@ -246,18 +299,13 @@ with predict_tab:
         c1.metric("Rows", f"{run_summary.get('rows', 0):,}")
         c2.metric("Allocated rows", f"{run_summary.get('allocated_rows', 0):,}")
         c3.metric("Total Final Alloc", f"{run_summary.get('total_final_alloc', 0):,}")
-        c4.metric("Ignored non-Alloc/Review", f"{run_summary.get('ignored_no_alloc_rows', 0):,}")
-        c5.metric("Review partial leftover units", f"{run_summary.get('review_partial_leftover_units', 0):,}")
+        c4.metric("Ignored rows", f"{run_summary.get('ignored_no_alloc_rows', 0):,}")
+        c5.metric("Model used", run_summary.get("selected_model_profile", "—"))
 
         st.info(
             f"Thresholds used — Base Allocation: `{run_summary.get('allocation_threshold')}` · "
             f"Base Review: `{run_summary.get('review_threshold')}`"
         )
-
-        section_rows = pd.DataFrame([{"section": k, "rows": v} for k, v in run_summary.get("section_rows", {}).items()])
-        if not section_rows.empty:
-            st.markdown("### Section rows")
-            st.bar_chart(section_rows.set_index("section"))
 
         left, right = st.columns(2)
         with left:
@@ -286,11 +334,11 @@ with predict_tab:
         d1, d2, d3 = st.columns(3)
         d1.download_button("Download completed CSV", completed_csv, "completed_allocation.csv", "text/csv")
         d2.download_button("Download audit CSV", audit_csv, "allocation_audit.csv", "text/csv")
-        d3.download_button("Download output ZIP", zip_bytes, "allocation_ai_two_model_output.zip", "application/zip")
+        d3.download_button("Download output ZIP", zip_bytes, "allocation_ai_output.zip", "application/zip")
     else:
         st.info("Upload a file and run prediction to generate completed allocation outputs.")
 
-with insights_tab:
+with tabs[1]:
     st.markdown("## Prediction Insights")
     if "audit_df" not in st.session_state:
         st.info("Run a prediction first to populate this page.")
@@ -333,58 +381,92 @@ with insights_tab:
             st.bar_chart(reasons.set_index("reason")["rows"])
 
         st.markdown("### Model feature usage")
-        st.caption("Approximate feature usage from neural-network first-layer weight magnitudes. This is an inspection view, not causal proof.")
         if fi.empty:
             st.info("No feature importance information was available.")
         else:
             family = _feature_family_summary(fi)
-            st.subheader("Feature family usage")
             st.dataframe(family, use_container_width=True, height=330)
-            if not family.empty:
-                pivot = family.pivot_table(index="feature_family", columns="model", values="importance", aggfunc="sum", fill_value=0)
-                st.bar_chart(pivot)
-            st.subheader("Top base features")
+            pivot = family.pivot_table(index="feature_family", columns="model", values="importance", aggfunc="sum", fill_value=0)
+            st.bar_chart(pivot)
             st.dataframe(fi.head(60), use_container_width=True, height=420)
 
         st.markdown("### Run-specific feature relationships")
-        st.caption("Correlations between engineered numeric features and this run's predicted probability / final allocation.")
         if rel.empty:
             st.info("No run-specific feature relationship table was available.")
         else:
             st.dataframe(rel.head(60), use_container_width=True, height=420)
             st.bar_chart(rel.head(25).set_index("feature")["relationship_strength"])
 
-with model_tab:
-    st.markdown("## Model Metrics")
-    st.caption("The app uses two separately trained MLP model bundles: one for Allocate rows and one for Review rows.")
+with tabs[2]:
+    st.markdown("## Base Model v1 vs Base Model v2")
+    rows = []
+    for key, prof in MODEL_PROFILES.items():
+        meta_pair, summary = all_meta[key]
+        for model_label in ["Base Allocation", "Base Review"]:
+            m = _metric_dict(meta_pair.get(model_label, {}))
+            rows.append({"Version": prof["short_label"], "Model": model_label, **m})
+    comp = pd.DataFrame(rows)
+    st.dataframe(comp, use_container_width=True, hide_index=True)
+    if not comp.empty:
+        chart_cols = [c for c in ["f1", "precision", "recall", "unit_mae", "row_near_match", "total_units_error"] if c in comp.columns]
+        for col in chart_cols:
+            st.markdown(f"### {col}")
+            st.bar_chart(comp.pivot_table(index="Version", columns="Model", values=col, aggfunc="first"))
 
+    st.markdown("### File status")
+    status_rows = []
+    for key, prof in MODEL_PROFILES.items():
+        for artifact_key in [
+            "allocate_model", "review_model", "allocate_metadata", "review_metadata", "summary",
+            "allocate_sweep", "review_sweep", "allocate_progress", "review_progress",
+            "allocate_validation", "review_validation", "allocate_backtest", "review_backtest",
+        ]:
+            path = BASE_DIR / prof[artifact_key]
+            status_rows.append({"Version": prof["short_label"], "Artifact": artifact_key, "Filename": prof[artifact_key], "Found": path.exists(), "Size MB": round(path.stat().st_size / (1024*1024), 3) if path.exists() else None})
+    st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+
+with tabs[3]:
+    st.markdown(f"## Selected Model Metrics: {profile['short_label']}")
     summary_rows = []
     for label in ["Base Allocation", "Base Review"]:
         meta = metadata.get(label, {})
-        m = _metric_dict(meta)
-        summary_rows.append({"Model": label, **m})
-    model_summary = pd.DataFrame(summary_rows)
-    st.dataframe(model_summary, use_container_width=True, hide_index=True)
+        summary_rows.append({"Model": label, **_metric_dict(meta)})
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-    for label in ["Base Allocation", "Base Review"]:
+    for label, prefix in [("Base Allocation", "allocate"), ("Base Review", "review")]:
         meta = metadata.get(label, {})
         m = _metric_dict(meta)
         st.divider()
         st.markdown(f"### {label}")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Rows trained/valid", f"{int(m.get('rows_train') or 0):,} / {int(m.get('rows_validation') or 0):,}")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Rows train/valid", f"{int(m.get('rows_train') or 0):,} / {int(m.get('rows_validation') or 0):,}")
         c2.metric("Best epoch", f"{int(m.get('best_epoch') or 0):,}")
         c3.metric("Threshold", _fmt(m.get("best_threshold"), 2))
-        c4.metric("Model size MB", _fmt(m.get("model_file_mb"), 2))
+        c4.metric("F1", _fmt(m.get("f1")))
+        c5.metric("Unit MAE", _fmt(m.get("unit_mae"), 4))
 
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("F1", _fmt(m.get("f1")))
-        p2.metric("Precision", _fmt(m.get("precision")))
-        p3.metric("Recall", _fmt(m.get("recall")))
-        p4.metric("Unit accuracy", _fmt(m.get("unit_accuracy")))
-        p5.metric("Unit MAE", _fmt(m.get("unit_mae"), 4))
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("Precision", _fmt(m.get("precision")))
+        x2.metric("Recall", _fmt(m.get("recall")))
+        x3.metric("Near match", _fmt(m.get("row_near_match")))
+        x4.metric("Total units error", f"{int(m.get('total_units_error') or 0):,}")
 
-        sweep = _read_csv(SWEEP_FILES[label])
+        flags = pd.DataFrame([
+            {"Feature": "Quantity correction", "Enabled": bool(m.get("quantity_correction_enabled"))},
+            {"Feature": "Override detector", "Enabled": bool(m.get("override_detector_enabled"))},
+            {"Feature": "Review recall recovery", "Enabled": bool(m.get("review_recall_recovery_enabled"))},
+            {"Feature": "DC scarcity model", "Enabled": bool(m.get("dc_scarcity_model_enabled"))},
+            {"Feature": "Reason-code model", "Enabled": bool(m.get("reason_code_model_enabled"))},
+            {"Feature": "Store behavior memory", "Enabled": bool(m.get("store_behavior_memory_enabled"))},
+        ])
+        st.dataframe(flags, use_container_width=True, hide_index=True)
+
+        backtest = read_json(_profile_path(profile_key, f"{prefix}_backtest"))
+        if backtest:
+            st.markdown("#### Workbook-like backtest")
+            st.json(backtest)
+
+        sweep = _read_csv(_profile_path(profile_key, f"{prefix}_sweep"))
         if not sweep.empty:
             st.markdown("#### Threshold sweep")
             st.dataframe(sweep, use_container_width=True, height=260)
@@ -392,7 +474,7 @@ with model_tab:
             if "threshold" in sweep.columns and cols:
                 st.line_chart(sweep.set_index("threshold")[cols])
 
-        progress = _read_csv(PROGRESS_FILES[label])
+        progress = _read_csv(_profile_path(profile_key, f"{prefix}_progress"))
         if not progress.empty:
             st.markdown("#### Training progress")
             st.dataframe(progress.tail(25), use_container_width=True, height=300)
@@ -400,70 +482,36 @@ with model_tab:
             if "epoch" in progress.columns and cols:
                 st.line_chart(progress.set_index("epoch")[cols])
 
-        val = _read_csv(VALIDATION_FILES[label])
-        if not val.empty:
-            st.markdown("#### Validation prediction sample")
-            st.dataframe(val.head(100), use_container_width=True, height=260)
-
         with st.expander(f"Full {label} metadata", expanded=False):
             st.json(meta)
 
     if summary_meta:
         st.divider()
-        st.markdown("### Full two-model system summary")
+        st.markdown("### Selected two-model system summary")
         st.json({k: v for k, v in summary_meta.items() if k != "models"})
 
-with process_tab:
-    st.markdown("## How the two-model system works")
+with tabs[4]:
+    st.markdown("## How the multi-model app works")
     st.markdown(
         """
-        This Streamlit app is a prediction-only interface for a section-aware allocation model.
+        This app includes two complete Base Allocation + Base Review model pairs.
 
-        **End-to-end flow**
-
-        1. Upload an allocation workbook as `.xlsb`, `.xlsx`, or `.csv`.
-        2. The app detects key workbook columns, including item, site, demand, supply, Final Alloc, Left DC, Alloc. Rec., FLM, flag, Demand Check, and Helper.
-        3. Rows marked **Allocate** are scored by the **Base Allocation** model.
-        4. Rows marked **Review** are scored by the **Base Review** model.
+        1. Select **Base Model v1** or **Base Model v2** in the sidebar.
+        2. Upload an allocation workbook as `.xlsb`, `.xlsx`, or `.csv`.
+        3. Rows marked **Allocate** are scored by the selected version's Allocation model.
+        4. Rows marked **Review** are scored by the selected version's Review model.
         5. Rows that are not Allocate or Review are ignored and left blank.
-        6. The app simulates remaining DC by item while filling Final Alloc.
-        7. Review rows are ranked by a blend of model priority, model probability, and need so the most important review rows consume scarce DC first.
-        8. The output is a completed CSV plus an audit CSV and explanation tables.
+        6. The prediction system simulates remaining DC by item and writes integer Final Alloc values or blanks.
+        7. Output downloads include the completed CSV, audit CSV, summary JSON, feature importance CSV, and feature relationship CSV.
+
+        **Base Model v1** is the existing uploaded model package.  
+        **Base Model v2** is the new v8 package with newer auxiliary heads and memory features when available.
         """
     )
 
-    st.markdown("### Core model features")
-    feature_groups = pd.DataFrame([
-        {"Feature group": "Demand / velocity", "Examples": "L30, D30, D60, LW, TTM, projected demand, recent velocity blend"},
-        {"Feature group": "Supply / DC", "Examples": "QOH, supply, DC available, Left DC, reconstructed DC before Final Alloc"},
-        {"Feature group": "Allocation recommendation", "Examples": "Alloc. Rec., Alloc. Rec. units, Alloc. Rec. to need/DC/projection ratios"},
-        {"Feature group": "Need / scarcity", "Examples": "Need gap, demand cap, need-to-DC pressure, DC-to-need ratio"},
-        {"Feature group": "Section/group context", "Examples": "Item totals, site totals, department/class totals, item-section totals"},
-        {"Feature group": "Ranking", "Examples": "Within-item rank by need, demand, Alloc. Rec., DC-before, and velocity"},
-        {"Feature group": "Workbook helper logic", "Examples": "Demand Check, Helper, Final Supply, FLM, partial leftover indicators"},
-        {"Feature group": "Categorical identity", "Examples": "Item, UPC, site, description, department, class, region, flag"},
-    ])
-    st.dataframe(feature_groups, use_container_width=True, hide_index=True)
-
-    st.markdown("### What makes this section-aware")
-    st.markdown(
-        """
-        The model is not only looking row by row. The training process rebuilt each row in context:
-
-        - How much demand exists for the item across all stores.
-        - How much need exists within the current section.
-        - How scarce DC is for the item.
-        - Where the row ranks among competing rows for the same item.
-        - How much DC likely existed **before** historical Final Alloc values were entered.
-
-        That section context is especially important for Review rows, where the model should prioritize rows that need product most.
-        """
-    )
-
-    st.markdown("### Model roles")
-    roles = pd.DataFrame([
-        {"Model": "Base Allocation", "Rows handled": "Allocate", "Main purpose": "Fill normal allocation rows with integer Final Alloc quantities."},
-        {"Model": "Base Review", "Rows handled": "Review", "Main purpose": "Rank and allocate Review rows, especially when DC is scarce."},
-        {"Model": "Ignored", "Rows handled": "No Alloc / Z / other", "Main purpose": "Left blank by design in this version."},
-    ])
-    st.dataframe(roles, use_container_width=True, hide_index=True)
+    st.markdown("### Exact non-duplicated model naming convention")
+    names = []
+    for key, prof in MODEL_PROFILES.items():
+        for artifact_key in ["allocate_model", "review_model", "allocate_metadata", "review_metadata", "summary"]:
+            names.append({"Version": prof["short_label"], "Artifact": artifact_key, "Filename": prof[artifact_key]})
+    st.dataframe(pd.DataFrame(names), use_container_width=True, hide_index=True)

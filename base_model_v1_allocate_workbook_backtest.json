@@ -1,0 +1,10 @@
+{
+  "section": "allocate",
+  "rows": 523,
+  "row_exact_match": 0.6347992351816444,
+  "row_near_match": 0.9579349904397706,
+  "unit_mae": 0.4168260038240918,
+  "predicted_total_units": 663,
+  "actual_total_units": 519,
+  "total_units_error": 144
+}
