@@ -69,13 +69,31 @@ def _load_joblib_with_split_support(path: str | Path):
     raise FileNotFoundError(f"Could not find model file {p} or split parts like {p.name}.part01")
 
 
+def _is_supported_numpy_bundle(bundle: dict) -> bool:
+    """Accept both exported NumPy bundle formats used by Allocation AI.
+
+    v1 was exported from sklearn MLP weights converted to NumPy.
+    v2 / keras_to_numpy was exported directly from Keras-trained dense layers.
+    Both run with NumPy only and require no TensorFlow or scikit-learn at runtime.
+    """
+    if not isinstance(bundle, dict):
+        return False
+    if bundle.get("format") == "allocation_ai_numpy_mlp_v1":
+        return True
+    if str(bundle.get("bundle_type", "")).startswith("allocation_ai_keras_numpy"):
+        return True
+    if bundle.get("metadata", {}).get("backend") == "keras_to_numpy":
+        return True
+    return False
+
+
 def _load_bundle(path: str | Path) -> dict:
     bundle = _load_joblib_with_split_support(path)
-    if not isinstance(bundle, dict) or bundle.get("format") != "allocation_ai_numpy_mlp_v1":
+    if not _is_supported_numpy_bundle(bundle):
         raise ValueError(
-            f"{path} is not a NumPy-only Allocation AI model bundle. "
-            "This Streamlit package intentionally does not use scikit-learn. "
-            "Use the converted *_numpy.joblib models included with this package."
+            f"{path} is not a supported NumPy-only Allocation AI model bundle. "
+            "This Streamlit package intentionally does not use scikit-learn or TensorFlow. "
+            "Use the converted NumPy model bundles exported by the trainer."
         )
     return bundle
 
@@ -207,6 +225,16 @@ def _mlp_raw(X: np.ndarray, model: dict) -> np.ndarray:
 
 
 def _mlp_predict(model: dict, X: np.ndarray) -> np.ndarray:
+    # Keras-to-NumPy direct layer format.
+    if "layers" in model:
+        raw = _keras_layers_raw(X, model)
+        output_type = model.get("output_type", "regression")
+        if output_type == "class":
+            return np.argmax(raw, axis=1).astype(int)
+        if output_type == "binary":
+            return (_sigmoid(raw).reshape(-1) >= 0.5).astype(int)
+        return raw.reshape(-1)
+
     raw = _mlp_raw(X, model)
     out_activation = model.get("out_activation", "identity")
     classes = model.get("classes")
@@ -220,11 +248,21 @@ def _mlp_predict(model: dict, X: np.ndarray) -> np.ndarray:
             idx = (p1 >= 0.5).astype(int)
             return classes[np.minimum(idx, len(classes)-1)]
         return classes[np.argmax(raw, axis=1)]
-    # regressor
     return raw.reshape(-1)
 
 
 def _mlp_predict_proba_positive(model: dict, X: np.ndarray) -> np.ndarray:
+    # Keras-to-NumPy direct layer format.
+    if "layers" in model:
+        raw = _keras_layers_raw(X, model)
+        output_type = model.get("output_type", "regression")
+        if output_type == "binary":
+            return _sigmoid(raw).reshape(-1)
+        if output_type == "class":
+            p = _softmax(raw)
+            return p[:, 1] if p.shape[1] > 1 else np.zeros(len(X), dtype=np.float32)
+        return np.clip(raw.reshape(-1), 0, 1)
+
     raw = _mlp_raw(X, model)
     classes = model.get("classes")
     out_activation = model.get("out_activation", "identity")
@@ -241,7 +279,75 @@ def _mlp_predict_proba_positive(model: dict, X: np.ndarray) -> np.ndarray:
 
 
 def _transform_numpy_preprocessor(X: pd.DataFrame, bundle: dict) -> np.ndarray:
+    """Transform feature frame using the NumPy-only preprocessor stored in the bundle.
+
+    Supports:
+      - allocation_ai_numpy_mlp_v1: sklearn-export style keys {numeric, categorical}
+      - keras_to_numpy bundles: direct keys {num_cols, cat_cols, median, mean, scale, categories}
+    """
     pre = bundle["preprocessor"]
+
+    # New Keras-to-NumPy export format.
+    if "num_cols" in pre or "cat_cols" in pre:
+        parts = []
+        ncols = list(pre.get("num_cols", []))
+        if ncols:
+            arr = np.zeros((len(X), len(ncols)), dtype=np.float32)
+            med_src = pre.get("median", {})
+            mean_src = pre.get("mean", {})
+            scale_src = pre.get("scale", {})
+            if isinstance(med_src, dict):
+                med = np.asarray([med_src.get(c, 0.0) for c in ncols], dtype=np.float32)
+            else:
+                med = np.asarray(med_src if med_src is not None else np.zeros(len(ncols)), dtype=np.float32)
+            if isinstance(mean_src, dict):
+                mean = np.asarray([mean_src.get(c, 0.0) for c in ncols], dtype=np.float32)
+            else:
+                mean = np.asarray(mean_src if mean_src is not None else np.zeros(len(ncols)), dtype=np.float32)
+            if isinstance(scale_src, dict):
+                scale = np.asarray([scale_src.get(c, 1.0) for c in ncols], dtype=np.float32)
+            else:
+                scale = np.asarray(scale_src if scale_src is not None else np.ones(len(ncols)), dtype=np.float32)
+            scale = np.where(np.abs(scale) < EPS, 1.0, scale)
+            for j, c in enumerate(ncols):
+                if c in X.columns:
+                    vals = pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan).to_numpy(dtype=np.float32)
+                else:
+                    vals = np.full(len(X), np.nan, dtype=np.float32)
+                vals = np.where(np.isfinite(vals), vals, med[j])
+                arr[:, j] = (vals - mean[j]) / scale[j]
+            parts.append(arr)
+
+        ccols = list(pre.get("cat_cols", []))
+        categories = pre.get("categories", {}) or {}
+        if ccols:
+            widths = []
+            maps = []
+            for c in ccols:
+                cmap = categories.get(c, {})
+                if isinstance(cmap, dict):
+                    maps.append({str(k): int(v) for k, v in cmap.items()})
+                    widths.append((max([int(v) for v in cmap.values()] + [-1]) + 1))
+                else:
+                    vals = list(cmap)
+                    maps.append({str(v): i for i, v in enumerate(vals)})
+                    widths.append(len(vals))
+            out = np.zeros((len(X), int(sum(widths))), dtype=np.float32)
+            offset = 0
+            for j, c in enumerate(ccols):
+                lookup = maps[j]
+                width = widths[j]
+                vals = X[c].astype(str).fillna("").str.strip().tolist() if c in X.columns else [""] * len(X)
+                for i, v in enumerate(vals):
+                    idx = lookup.get(str(v))
+                    if idx is not None and 0 <= idx < width:
+                        out[i, offset + idx] = 1.0
+                offset += width
+            parts.append(out)
+
+        return np.concatenate(parts, axis=1).astype(np.float32, copy=False) if parts else np.zeros((len(X), 0), dtype=np.float32)
+
+    # Original v1 sklearn-export-to-NumPy format.
     num = pre.get("numeric", {})
     cat = pre.get("categorical", {})
     parts = []
@@ -268,7 +374,6 @@ def _transform_numpy_preprocessor(X: pd.DataFrame, bundle: dict) -> np.ndarray:
         nouts = list(map(int, cat.get("n_features_outs", [])))
         total = int(sum(nouts))
         out = np.zeros((len(X), total), dtype=np.float32)
-        cats = cat.get("categories", [])
         cat_to_idx = cat.get("category_to_index", [])
         maps = cat.get("maps", [])
         fill = str(cat.get("fill_value", "") or "")
@@ -277,14 +382,11 @@ def _transform_numpy_preprocessor(X: pd.DataFrame, bundle: dict) -> np.ndarray:
             width = nouts[j]
             lookup = cat_to_idx[j] if j < len(cat_to_idx) else {}
             mapping = np.asarray(maps[j], dtype=np.int32) if j < len(maps) else None
-            if c in X.columns:
-                vals = X[c].astype(str).fillna(fill).str.strip().tolist()
-            else:
-                vals = [fill] * len(X)
+            vals = X[c].astype(str).fillna(fill).str.strip().tolist() if c in X.columns else [fill] * len(X)
             for i, v in enumerate(vals):
                 orig_idx = lookup.get(str(v))
                 if orig_idx is None:
-                    continue  # handle_unknown='ignore'
+                    continue
                 mapped = int(mapping[orig_idx]) if mapping is not None and orig_idx < len(mapping) else int(orig_idx)
                 if 0 <= mapped < width:
                     out[i, offset + mapped] = 1.0
@@ -295,6 +397,15 @@ def _transform_numpy_preprocessor(X: pd.DataFrame, bundle: dict) -> np.ndarray:
         return np.zeros((len(X), 0), dtype=np.float32)
     return np.concatenate(parts, axis=1).astype(np.float32, copy=False)
 
+
+def _keras_layers_raw(X: np.ndarray, model: dict) -> np.ndarray:
+    h = X.astype(np.float32, copy=False)
+    layers = model.get("layers", [])
+    for i, layer in enumerate(layers):
+        h = h @ np.asarray(layer["W"], dtype=np.float32) + np.asarray(layer["b"], dtype=np.float32)
+        if i < len(layers) - 1:
+            h = np.maximum(h, 0)
+    return h
 
 def _predict_model(df: pd.DataFrame, bundle: dict, chunk_size: int = 2500) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if len(df) == 0:
@@ -564,17 +675,55 @@ def feature_family(name: str) -> str:
     return "Other"
 
 
+def _transformed_names_from_bundle(bundle: dict, input_dim: int | None = None) -> list[str]:
+    names = list(bundle.get("transformed_feature_names", []) or [])
+    if names:
+        return names
+    pre = bundle.get("preprocessor", {})
+    out = []
+    if "num_cols" in pre or "cat_cols" in pre:
+        out.extend(list(pre.get("num_cols", [])))
+        cats = pre.get("categories", {}) or {}
+        for c in list(pre.get("cat_cols", [])):
+            cmap = cats.get(c, {})
+            if isinstance(cmap, dict):
+                # Sort by encoded index so names align with the one-hot columns.
+                vals = sorted(cmap.items(), key=lambda kv: int(kv[1]))
+                out.extend([f"{c}_{str(v)}" for v, _idx in vals])
+            else:
+                out.extend([f"{c}_{str(v)}" for v in list(cmap)])
+    else:
+        num = pre.get("numeric", {})
+        cat = pre.get("categorical", {})
+        out.extend(list(num.get("columns", [])))
+        ccols = list(cat.get("columns", []))
+        categories = cat.get("categories", [])
+        nouts = list(map(int, cat.get("n_features_outs", []))) if cat.get("n_features_outs") is not None else []
+        for j, c in enumerate(ccols):
+            vals = list(categories[j]) if j < len(categories) else [str(i) for i in range(nouts[j] if j < len(nouts) else 0)]
+            if j < len(nouts):
+                vals = vals[:nouts[j]]
+            out.extend([f"{c}_{str(v)}" for v in vals])
+    if input_dim is not None and len(out) != int(input_dim):
+        return [f"transformed_feature_{i}" for i in range(int(input_dim))]
+    return out
+
+
 def model_feature_importance(bundle: dict, model_label: str, top_n: int = 80) -> pd.DataFrame:
-    names = list(bundle.get("transformed_feature_names", []))
     rows = []
     for head_name, key in [("unit", "unit_model"), ("probability", "prob_model"), ("priority", "priority_model")]:
         model = bundle.get(key)
-        if not model or not model.get("coefs"):
+        if not model:
             continue
-        w = np.asarray(model["coefs"][0])
+        if model.get("coefs"):
+            w = np.asarray(model["coefs"][0])
+        elif model.get("layers"):
+            w = np.asarray(model["layers"][0]["W"])
+        else:
+            continue
         imp = np.mean(np.abs(w), axis=1)
-        local_names = names if len(names) == len(imp) else [f"transformed_feature_{i}" for i in range(len(imp))]
-        for fname, val in zip(local_names, imp):
+        names = _transformed_names_from_bundle(bundle, len(imp))
+        for fname, val in zip(names, imp):
             base = _simplify_feature_name(fname)
             rows.append({
                 "model": model_label,

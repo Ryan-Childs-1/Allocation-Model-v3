@@ -1,30 +1,29 @@
-# Allocation AI Two-Model Predictor — NumPy-only runtime
+# Allocation AI Two-Model Streamlit App
 
-This Streamlit app uses two converted NumPy-only MLP bundles:
+This is a Streamlit prediction app for allocation workbooks. It uses two built-in NumPy-only model bundles:
 
-- `base_allocation_numpy_model.joblib`
-- `base_review_numpy_model.joblib`
+- **Base Allocation** for rows flagged Allocate
+- **Base Review** for rows flagged Review, including priority/ranking logic
 
-It does **not** require scikit-learn or scipy at runtime. The app loads Excel/CSV allocation files, scores Allocate and Review rows with separate models, simulates remaining DC by item, and outputs completed allocation CSV/audit files.
+The app intentionally does **not** require scikit-learn, TensorFlow, or Keras at runtime.
 
-## Streamlit entry point
+## Run locally
 
-`app.py`
-
-## Requirements
-
-```text
-streamlit
-pandas
-numpy
-joblib
-pyxlsb
-openpyxl
+```bash
+pip install -r requirements.txt
+streamlit run app.py
 ```
 
-## Notes
+## Deployment
 
-- Rows not flagged Allocate or Review are ignored and left blank.
-- Review rows are ranked using priority/probability/need settings.
-- Review rows may receive below-FLM leftover DC when enabled.
-- The sidebar includes explanations for every setting.
+Upload all files in this flat folder to Streamlit Cloud / GitHub. Do not remove the `.joblib`, `.json`, or `.csv` model artifacts.
+
+## Output
+
+The app returns:
+
+- completed allocation CSV
+- allocation audit CSV
+- prediction summary JSON
+- feature importance CSV
+- feature relationship CSV

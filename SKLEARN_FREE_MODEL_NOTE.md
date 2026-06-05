@@ -1,10 +1,12 @@
-# sklearn-free runtime note
+# Runtime Model Format
 
-The original Base Allocation and Base Review sklearn MLP models were converted into NumPy-only model bundles. The bundles contain:
+The Streamlit app uses NumPy-only model bundles. The models were trained outside the app and exported to lightweight joblib dictionaries containing preprocessing values and MLP weights.
 
-- numeric imputer/scaler parameters
-- one-hot category mappings, including infrequent-category grouping
-- MLP weights and biases
-- model metadata and thresholds
+The hosted Streamlit app does not install or import:
 
-This allows Streamlit prediction without installing `scikit-learn`. Training still requires a training environment, but deployment/prediction does not.
+- scikit-learn
+- TensorFlow
+- Keras
+- scipy
+
+This avoids wheel build failures on Streamlit Cloud and keeps deployment simpler.

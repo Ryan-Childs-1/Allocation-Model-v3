@@ -173,7 +173,7 @@ with st.sidebar:
         )
 
 st.title(APP_TITLE)
-st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system. This version runs with NumPy-only model bundles and does not install scikit-learn.")
+st.caption("Upload an allocation workbook and return the same rows with Final Alloc filled by the two-model section-aware MLP system. This version runs with NumPy-only model bundles exported from the latest trainer and does not install scikit-learn or TensorFlow.")
 
 predict_tab, insights_tab, model_tab, process_tab = st.tabs([
     "Predict Allocation",
