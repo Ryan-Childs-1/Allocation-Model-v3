@@ -1,0 +1,10 @@
+{
+  "section": "review",
+  "rows": 268,
+  "row_exact_match": 0.8694029850746269,
+  "row_near_match": 0.9850746268656716,
+  "unit_mae": 0.15298507462686567,
+  "predicted_total_units": 11,
+  "actual_total_units": 52,
+  "total_units_error": -41
+}

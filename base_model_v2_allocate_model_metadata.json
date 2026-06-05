@@ -1,0 +1,202 @@
+{
+  "model_name": "Base Allocation",
+  "section": "allocate",
+  "backend": "keras_to_numpy",
+  "rows_total": 9586,
+  "rows_train": 9063,
+  "rows_validation": 523,
+  "positive_rows_total": 6656,
+  "negative_rows_total": 2930,
+  "no_alloc_negative_mixing_enabled": true,
+  "no_alloc_negative_ratio": 0.55,
+  "counterfactual_augmentation_enabled": true,
+  "store_behavior_memory_enabled": true,
+  "store_memory_site_count": 147,
+  "best_epoch": 12,
+  "best_threshold": 0.01,
+  "threshold_modes": {
+    "balanced": 0.01,
+    "conservative": 0.01,
+    "aggressive": 0.01,
+    "max_precision": 0.01,
+    "max_recall": 0.01
+  },
+  "best_validation_metrics": {
+    "threshold": 0.01,
+    "precision": 0.997275204359673,
+    "recall": 0.8043956043956044,
+    "f1": 0.8905109489051095,
+    "unit_accuracy": 0.6290630975143403,
+    "positive_unit_accuracy": 0.5758241758241758,
+    "unit_mae": 0.4149139579349904,
+    "false_positive_rate": 0.014705882352941176,
+    "predicted_positive_rows": 367.0,
+    "actual_positive_rows": 455.0
+  },
+  "priority_validation_summary": {
+    "priority_mean_positive": 0.821587324142456,
+    "priority_mean_negative": 0.5318794846534729
+  },
+  "override_detector_summary": {
+    "override_prob_mean": 0.18202845752239227,
+    "override_prob_positive_mean": 0.062263041734695435,
+    "override_prob_negative_mean": 0.9833998084068298
+  },
+  "scarcity_mode_summary": {
+    "0": 463,
+    "1": 56,
+    "2": 4,
+    "3": 0
+  },
+  "reason_code_summary": {
+    "0": 0,
+    "1": 0,
+    "2": 372,
+    "3": 135,
+    "4": 0,
+    "5": 16,
+    "6": 0
+  },
+  "quantity_correction_enabled": true,
+  "override_detector_enabled": true,
+  "review_recall_recovery_enabled": false,
+  "dc_scarcity_model_enabled": true,
+  "reason_code_model_enabled": true,
+  "config": {
+    "artifact_short_name": "base_allocation_review_v8_recall_scarcity_memory",
+    "max_units": 240,
+    "validation_size": 0.2,
+    "random_state": 42,
+    "validation_method": "holdout_by_file",
+    "cached_dataset_path": "two_model_advanced_training_dataset.pkl",
+    "rebuild_dataset": false,
+    "legacy_cached_dataset_paths": [
+      "two_mlp_allocate_review_training_dataset.pkl",
+      "tri_mlp_allocation_training_dataset.pkl",
+      "two_model_advanced_training_dataset.pkl",
+      "cache/two_mlp_allocate_review_training_dataset.pkl",
+      "cache/tri_mlp_allocation_training_dataset.pkl",
+      "cache/two_model_advanced_training_dataset.pkl"
+    ],
+    "auto_discover_pickle_cache": true,
+    "save_normalized_cache": true,
+    "min_category_frequency": 4,
+    "max_categories": 3500,
+    "model_size_cap_mb": 24.0,
+    "compression": 9,
+    "backend": "keras",
+    "allocation_epochs": 80,
+    "review_epochs": 100,
+    "batch_size": 512,
+    "learning_rate": 0.0005,
+    "l2": 0.0002,
+    "early_stopping_patience": 12,
+    "early_stopping_min_delta": 0.0005,
+    "eval_every": 1,
+    "allocation_unit_layers": [
+      256,
+      128,
+      64
+    ],
+    "allocation_prob_layers": [
+      192,
+      96,
+      48
+    ],
+    "allocation_priority_layers": [
+      160,
+      80,
+      40
+    ],
+    "review_unit_layers": [
+      320,
+      160,
+      80
+    ],
+    "review_prob_layers": [
+      224,
+      112,
+      56
+    ],
+    "review_priority_layers": [
+      256,
+      128,
+      64
+    ],
+    "positive_repeat_allocate": 2,
+    "positive_repeat_review": 3,
+    "include_no_alloc_negatives": true,
+    "no_alloc_negative_ratio_allocate": 0.55,
+    "no_alloc_negative_ratio_review": 0.85,
+    "max_no_alloc_negatives_per_section": 50000,
+    "no_alloc_negative_source_sections": [
+      "z_no_alloc",
+      "other"
+    ],
+    "review_priority_boost": 1.35,
+    "unit_near_miss_tolerance": 1,
+    "use_quantity_correction_model": true,
+    "quantity_correction_layers": [
+      128,
+      64,
+      32
+    ],
+    "quantity_correction_classes": 7,
+    "use_override_detector": true,
+    "override_detector_layers": [
+      128,
+      64,
+      32
+    ],
+    "run_optimizer_backtest": true,
+    "optimizer_priority_weight": 0.55,
+    "optimizer_probability_weight": 0.25,
+    "optimizer_need_weight": 0.15,
+    "optimizer_alloc_rec_weight": 0.05,
+    "use_review_recall_recovery_model": true,
+    "review_recall_recovery_layers": [
+      160,
+      80,
+      40
+    ],
+    "review_recall_recovery_threshold": 0.25,
+    "use_dc_scarcity_model": true,
+    "dc_scarcity_layers": [
+      128,
+      64,
+      32
+    ],
+    "scarcity_threshold_adjustment": 0.1,
+    "use_reason_code_model": true,
+    "reason_code_layers": [
+      128,
+      64,
+      32
+    ],
+    "reason_code_classes": 7,
+    "use_store_behavior_memory": true,
+    "store_memory_min_rows": 3,
+    "use_counterfactual_augmentation": true,
+    "counterfactual_fraction": 0.35,
+    "counterfactual_max_rows_per_section": 60000,
+    "export_validation_predictions": true,
+    "run_workbook_backtest": true,
+    "threshold_grid": [
+      0.01,
+      0.03,
+      0.05,
+      0.1,
+      0.2,
+      0.35,
+      0.5,
+      0.65,
+      0.8,
+      0.9,
+      0.95
+    ]
+  },
+  "trained_at_unix": 1780628509.523934,
+  "streamlit_runtime": "numpy_only_no_tensorflow_no_sklearn",
+  "model_file_mb": 13.369112968444824,
+  "model_under_size_cap": true
+}
